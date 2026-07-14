@@ -1,0 +1,189 @@
+name: Build & Release (Windows / Linux / macOS)
+
+# Builds the LATEST upstream armory3d/armorpaint for Windows, Linux and
+# macOS and publishes them together as a single rolling GitHub Release on
+# this fork. Upstream ships ArmorPaint as a paid download and has not cut a
+# git tag since 23.09 (Sept 2023) while `main` keeps moving, so this fork
+# exists to provide free, up-to-date community builds.
+#
+# A daily `check` job compares upstream HEAD against the SHA embedded in the
+# latest release tag (armorpaint-<date>-<sha>) and skips the whole build
+# matrix when upstream hasn't moved, so a release only appears when there is
+# something new to build. `workflow_dispatch` bypasses the check and always
+# builds.
+#
+# This fork is a stock mirror, so the build clones upstream `main` fresh and
+# builds it, independent of how far behind this fork's own branches happen to
+# be. Nothing is fetched at build time beyond the upstream clone: the amake
+# build tool and all dependencies are vendored in the repo.
+
+on:
+  schedule:
+    # Daily 11:00 UTC - midday UK in summer, 11:00 in winter (cron can't
+    # follow DST), so releases land while someone is awake to notice them.
+    # The `check` job makes no-change runs cost seconds, so polling daily is
+    # cheap. NOTE: GitHub only runs `schedule` from the repo's DEFAULT
+    # branch, so this branch must be set as the fork's default.
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_URL: https://github.com/armory3d/armorpaint.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+      sha: ${{ steps.gate.outputs.sha }}
+    steps:
+      - name: 🕵️ Compare upstream HEAD with last release
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          SHA=$(git ls-remote "$UPSTREAM_URL" "refs/heads/$UPSTREAM_BRANCH" | cut -c1-7)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          # Latest release tag looks like armorpaint-<date>-<sha>; the suffix
+          # is the upstream SHA that release was built from.
+          LAST_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+          LAST_SHA="${LAST_TAG##*-}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "🔧 Manual run - building regardless of upstream state."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SHA" = "$LAST_SHA" ]; then
+            echo "✅ Upstream $UPSTREAM_BRANCH still at $SHA (last release: ${LAST_TAG:-none}). Nothing to build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "🆕 Upstream moved: ${LAST_SHA:-none} -> $SHA. Building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            asset: ArmorPaint-linux-x64.tar.gz
+          - os: windows-latest
+            platform: windows
+            asset: ArmorPaint-windows-x64.zip
+          - os: macos-latest
+            platform: macos
+            asset: ArmorPaint-macos-arm64.zip
+    steps:
+      - name: 🧰 Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --quiet make clang libvulkan-dev libgtk-3-dev libasound2-dev
+
+      - name: 📂 Clone pristine upstream (${{ env.UPSTREAM_BRANCH }})
+        run: git clone --single-branch --depth 1 -b "${{ env.UPSTREAM_BRANCH }}" "${{ env.UPSTREAM_URL }}" armorpaint-src
+
+      - name: 🔨 Build
+        # Forward slashes work in every runner's default shell; on Windows
+        # PowerShell resolves `../base/make` to `make.bat`. This matches
+        # upstream's own per-platform smoke-test workflows.
+        run: |
+          cd armorpaint-src/paint
+          ../base/make --compile
+
+      - name: 📦 Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          tar -C armorpaint-src/paint/build/out -czf "dist/${{ matrix.asset }}" .
+          ls -l dist
+
+      - name: 📦 Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # xcodebuild's output dir varies; locate the bundle rather than
+          # hardcoding build/Release.
+          APP=$(find armorpaint-src/paint/build -maxdepth 4 -type d -name 'ArmorPaint.app' | head -n1)
+          if [ -z "$APP" ]; then echo "::error::ArmorPaint.app not found under paint/build"; exit 1; fi
+          echo "Packaging $APP"
+          ditto -c -k --keepParent "$APP" "dist/${{ matrix.asset }}"
+          ls -l dist
+
+      - name: 📦 Package Windows
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path armorpaint-src\paint\build\out\* -DestinationPath "dist\${{ matrix.asset }}"
+          Get-ChildItem dist
+
+      - name: 💾 Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: [check, build]
+    # Publish even if some matrix legs failed (fail-fast is off), but not when
+    # the check job decided there was nothing new to build.
+    if: ${{ !cancelled() && needs.check.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Collect all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*"
+          merge-multiple: true
+
+      - name: 🏷️ Resolve version
+        id: ver
+        run: |
+          # Use the SHA the check job saw, not a fresh ls-remote: if upstream
+          # moves mid-build, the tag should still match what was built.
+          echo "sha=${{ needs.check.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: 📦 List collected files
+        run: ls -l dist || true
+
+      - name: 🚀 Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: armorpaint-${{ steps.ver.outputs.date }}-${{ steps.ver.outputs.sha }}
+          name: ArmorPaint (upstream ${{ steps.ver.outputs.sha }})
+          body: |
+            Automated community build of ArmorPaint for Windows, Linux and macOS.
+
+            - Built from upstream [`armory3d/armorpaint`](https://github.com/armory3d/armorpaint/commit/${{ steps.ver.outputs.sha }}) `${{ env.UPSTREAM_BRANCH }}` @ `${{ steps.ver.outputs.sha }}`
+            - Stock upstream sources, nothing added.
+
+            **Downloads**
+            - Windows x64: `ArmorPaint-windows-x64.zip`
+            - Linux x64: `ArmorPaint-linux-x64.tar.gz`
+            - macOS arm64: `ArmorPaint-macos-arm64.zip`
+
+            **macOS note:** the `.app` is unsigned, so the first launch is
+            blocked by Gatekeeper. Right-click the app and choose *Open*, or
+            run `xattr -dr com.apple.quarantine ArmorPaint.app`.
+          files: dist/*
+          fail_on_unmatched_files: false

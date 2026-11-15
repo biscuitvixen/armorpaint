@@ -7,10 +7,12 @@ name: Build & Release (Windows / Linux / macOS)
 # exists to provide free, up-to-date community builds.
 #
 # A daily `check` job compares upstream HEAD against the SHA embedded in the
-# latest release tag (armorpaint-<date>-<sha>) and skips the whole build
-# matrix when upstream hasn't moved, so a release only appears when there is
-# something new to build. `workflow_dispatch` bypasses the check and always
-# builds.
+# latest release tag (armorpaint-<date>-<sha>). Upstream commits most days,
+# so a new release is built only once the last one is about a week old;
+# between those, the daily run only rebuilds the latest release when it is
+# missing a platform's asset and upstream is still at the same SHA, which
+# covers a matrix leg that never got a runner. `workflow_dispatch` bypasses
+# the check and always builds.
 #
 # This fork is a stock mirror, so the build clones upstream `main` fresh and
 # builds it, independent of how far behind this fork's own branches happen to
@@ -19,12 +21,14 @@ name: Build & Release (Windows / Linux / macOS)
 
 on:
   schedule:
-    # Daily 11:00 UTC - midday UK in summer, 11:00 in winter (cron can't
-    # follow DST), so releases land while someone is awake to notice them.
-    # The `check` job makes no-change runs cost seconds, so polling daily is
-    # cheap. NOTE: GitHub only runs `schedule` from the repo's DEFAULT
-    # branch, so this branch must be set as the fork's default.
-    - cron: "0 11 * * *"
+    # Daily 06:17 UTC. Schedules on the hour are delayed most under load,
+    # and hosted macOS arm64 runners are scarcest during US working hours,
+    # where a job left queued for 15 minutes is cancelled unacquired; an
+    # odd minute early in the UK morning avoids both. The `check` job makes
+    # no-change runs cost seconds, so polling daily is cheap. NOTE: GitHub
+    # only runs `schedule` from the repo's DEFAULT branch, so this branch
+    # must be set as the fork's default.
+    - cron: "17 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -37,6 +41,9 @@ concurrency:
 env:
   UPSTREAM_URL: https://github.com/armory3d/armorpaint.git
   UPSTREAM_BRANCH: main
+  # 6.5 days: a week less slack for scheduled runs starting late, so a
+  # release published a few hours after its cron does not slip a day.
+  RELEASE_GAP_HOURS: 156
 
 jobs:
   check:
@@ -44,12 +51,15 @@ jobs:
     outputs:
       build: ${{ steps.gate.outputs.build }}
       sha: ${{ steps.gate.outputs.sha }}
+      tag: ${{ steps.gate.outputs.tag }}
     steps:
       - name: 🕵️ Compare upstream HEAD with last release
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # Must match the `asset` names in the build matrix.
+          EXPECTED_ASSETS: '["ArmorPaint-linux-x64.tar.gz", "ArmorPaint-windows-x64.zip", "ArmorPaint-macos-arm64.zip"]'
         run: |
           set -euo pipefail
 
@@ -57,20 +67,44 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
           # Latest release tag looks like armorpaint-<date>-<sha>; the suffix
-          # is the upstream SHA that release was built from.
-          LAST_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || true)
+          # is the upstream SHA that release was built from. No release yet
+          # reads as an empty object, so every asset counts as missing.
+          LAST=$(gh release view --json tagName,assets,publishedAt 2>/dev/null || echo '{}')
+          LAST_TAG=$(jq -r '.tagName // ""' <<< "$LAST")
           LAST_SHA="${LAST_TAG##*-}"
+
+          # Expected assets absent from that release, space-separated.
+          MISSING=$(jq -r --argjson want "$EXPECTED_ASSETS" \
+            '$want - [.assets[]?.name] | join(" ")' <<< "$LAST")
+
+          # Hours since that release was published; no release reads as the
+          # epoch, which is always old enough.
+          PUBLISHED=$(jq -r '.publishedAt // "@0"' <<< "$LAST")
+          AGE_HOURS=$(( ($(date -u +%s) - $(date -u -d "$PUBLISHED" +%s)) / 3600 ))
+
+          # The tag is fixed here, not when publishing, so the release job
+          # names what this job decided to build. A gap-fill reuses the
+          # existing tag and adds the missing assets to that release.
+          TAG="armorpaint-$(date -u +%Y%m%d)-$SHA"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "🔧 Manual run - building regardless of upstream state."
             echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SHA" = "$LAST_SHA" ] && [ -n "$MISSING" ]; then
+            echo "🧩 $LAST_TAG is missing: $MISSING. Rebuilding $SHA into it."
+            TAG="$LAST_TAG"
+            echo "build=true" >> "$GITHUB_OUTPUT"
           elif [ "$SHA" = "$LAST_SHA" ]; then
             echo "✅ Upstream $UPSTREAM_BRANCH still at $SHA (last release: ${LAST_TAG:-none}). Nothing to build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif [ "$AGE_HOURS" -lt "$RELEASE_GAP_HOURS" ]; then
+            echo "⏳ Upstream moved: $LAST_SHA -> $SHA, but $LAST_TAG is only ${AGE_HOURS}h old (gap: ${RELEASE_GAP_HOURS}h). Waiting."
             echo "build=false" >> "$GITHUB_OUTPUT"
           else
             echo "🆕 Upstream moved: ${LAST_SHA:-none} -> $SHA. Building."
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check
@@ -161,7 +195,7 @@ jobs:
           # Use the SHA the check job saw, not a fresh ls-remote: if upstream
           # moves mid-build, the tag should still match what was built.
           echo "sha=${{ needs.check.outputs.sha }}" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ needs.check.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: 📦 List collected files
         run: ls -l dist || true
@@ -169,7 +203,7 @@ jobs:
       - name: 🚀 Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: armorpaint-${{ steps.ver.outputs.date }}-${{ steps.ver.outputs.sha }}
+          tag_name: ${{ steps.ver.outputs.tag }}
           name: ArmorPaint (upstream ${{ steps.ver.outputs.sha }})
           body: |
             Automated community build of ArmorPaint for Windows, Linux and macOS.

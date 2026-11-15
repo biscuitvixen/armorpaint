@@ -11,13 +11,56 @@ bool util_layer_is_path_point_dragging() {
 	return path_point_dragging >= 0;
 }
 
+// Sculpt rest pose kept while a point is dragged
+static gpu_texture_t *path_sculpt_rest = NULL;
+
+static void path_free_sculpt_rest() {
+	if (path_sculpt_rest != NULL) {
+		gpu_delete_texture(path_sculpt_rest);
+		path_sculpt_rest = NULL;
+	}
+}
+
+static void path_copy_sculpt(gpu_texture_t *dst, gpu_texture_t *src) {
+	draw_begin(dst, false, 0);
+	draw_set_pipeline(pipes_copy128);
+	draw_scaled_image(src, 0, 0, dst->width, dst->height);
+	draw_set_pipeline(NULL);
+	draw_end();
+}
+
+static void path_clear_layer(slot_layer_t *l) {
+	gpu_texture_t *sculpt = l->texpaint_sculpt;
+	if (sculpt == NULL || path_point_dragging < 0) {
+		path_free_sculpt_rest();
+		slot_layer_clear(l, 0x00000000, NULL, 1.0, layers_default_rough, 0.0);
+		return;
+	}
+
+	if (path_sculpt_rest != NULL && (path_sculpt_rest->width != sculpt->width || path_sculpt_rest->height != sculpt->height)) {
+		path_free_sculpt_rest();
+	}
+	if (path_sculpt_rest == NULL) {
+		slot_layer_clear(l, 0x00000000, NULL, 1.0, layers_default_rough, 0.0);
+		path_sculpt_rest = gpu_create_render_target(sculpt->width, sculpt->height, GPU_TEXTURE_FORMAT_RGBA128);
+		path_copy_sculpt(path_sculpt_rest, sculpt);
+	}
+	else {
+		l->texpaint_sculpt = NULL;
+		slot_layer_clear(l, 0x00000000, NULL, 1.0, layers_default_rough, 0.0);
+		l->texpaint_sculpt = sculpt;
+		path_copy_sculpt(sculpt, path_sculpt_rest);
+	}
+}
+
 static void path_destroy_spheres() {
 	for (i32 i = 0; i < path_point_sphere_count; i++) {
 		mesh_object_remove((mesh_object_t *)path_point_spheres[i]->ext);
 	}
-	gc_free(path_point_spheres);
+	free(path_point_spheres);
 	path_point_spheres      = NULL;
 	path_point_sphere_count = 0;
+	path_free_sculpt_rest();
 }
 
 static bool project_to_screen(vec4_t wpos, f32 *sx, f32 *sy) {
@@ -35,9 +78,74 @@ static f32 bezier_eval(f32 p0, f32 pc, f32 p1, f32 t) {
 	return t1 * t1 * t1 * p0 + 3.0f * t * t1 * pc + t * t * t * p1;
 }
 
+static vec4_t bezier_eval_vec4(vec4_t p0, vec4_t pc, vec4_t p1, f32 t) {
+	return (vec4_t){bezier_eval(p0.x, pc.x, p1.x, t), bezier_eval(p0.y, pc.y, p1.y, t), bezier_eval(p0.z, pc.z, p1.z, t), 0.0f};
+}
+
+// Segment painted by the current path dab, read by shader nodes as constants.path_a, path_b and path_length
+// Positions are in world space, w holds the arc length along the path
+static bool   path_segment_active = false;
+static vec4_t path_segment_a;
+static vec4_t path_segment_b;
+static f32    path_segment_length;
+
+vec4_t util_layer_path_segment_a() {
+	return path_segment_active ? path_segment_a : (vec4_t){0.0f, 0.0f, -1.0f, 0.0f}; // Previews get a vertical line through the origin
+}
+
+vec4_t util_layer_path_segment_b() {
+	return path_segment_active ? path_segment_b : (vec4_t){0.0f, 0.0f, 1.0f, 2.0f};
+}
+
+f32 util_layer_path_length() {
+	return path_segment_active ? path_segment_length : 2.0f;
+}
+
+static vec4_t path_point_world(f32_array_t *points_world, i32 i) {
+	return (vec4_t){points_world->buffer[i * 3], points_world->buffer[i * 3 + 1], points_world->buffer[i * 3 + 2], 0.0f};
+}
+
+static void path_segment_set(vec4_t a, f32 sa, vec4_t b, f32 sb) {
+	path_segment_a = (vec4_t){a.x, a.y, a.z, sa};
+	path_segment_b = (vec4_t){b.x, b.y, b.z, sb};
+}
+
+// Arc length at each anchor, a point continues from its parent
+static f32 *path_arc_lengths(f32_array_t *points_world, i32_array_t *points_parent, i32 num_world, i32 num_parent, bool curved) {
+	f32 *sl             = calloc(num_world > 0 ? num_world : 1, sizeof(f32));
+	path_segment_length = 0.0f;
+	for (i32 i = curved ? 2 : 1; i < num_world; i += curved ? 2 : 1) {
+		i32 p = i < num_parent ? points_parent->buffer[i] : (curved ? i - 2 : i - 1);
+		if (p < 0 || p >= i) {
+			continue;
+		}
+		vec4_t a = path_point_world(points_world, p);
+		vec4_t b = path_point_world(points_world, i);
+		if (curved) {
+			vec4_t c    = path_point_world(points_world, i - 1);
+			vec4_t prev = a;
+			f32    len  = 0.0f;
+			for (i32 k = 1; k <= 32; k++) {
+				vec4_t q = bezier_eval_vec4(a, c, b, k / 32.0f);
+				len += vec4_dist(q, prev);
+				prev = q;
+			}
+			sl[i] = sl[p] + len;
+		}
+		else {
+			sl[i] = sl[p] + vec4_dist(a, b);
+		}
+		path_segment_length = sl[i] > path_segment_length ? sl[i] : path_segment_length;
+	}
+	return sl;
+}
+
 f32 util_layer_brush_screen_radius() {
-	f32  r_world = g_context->brush_radius * g_context->brush_nodes_radius / 15.0f * 2.0f;
-	bool on_mesh = math_abs(g_context->posx_picked) < 50.0f && math_abs(g_context->posy_picked) < 50.0f && math_abs(g_context->posz_picked) < 50.0f;
+	// Prevent cursor jumping constantly if randomness is used in brush nodes
+	f32 brush_nodes_radius = g_context->brush_nodes_uses_random ? 1.0f : g_context->brush_nodes_radius;
+
+	f32  r_world = g_context->brush_radius * brush_nodes_radius / 15.0f * 2.0f;
+	bool on_mesh = util_render_picked_on_mesh();
 	if (!on_mesh) {
 		return r_world;
 	}
@@ -68,8 +176,18 @@ static void path_push_camera(f32_array_t *ar) {
 	f32_array_push(ar, sys_w() / (f32)sys_h());
 }
 
+// Camera last applied by path_set_camera during the current repaint
+static bool path_camera_applied = false;
+static f32  path_camera_applied_values[9];
+
 static void path_set_camera(f32_array_t *points_camera, i32 num_camera, i32 ci) {
 	if (ci < num_camera) {
+		// Points are usually placed from the same view, skip redrawing the gbuffer for it
+		if (path_camera_applied && memcmp(path_camera_applied_values, &points_camera->buffer[ci * 9], sizeof(path_camera_applied_values)) == 0) {
+			return;
+		}
+		memcpy(path_camera_applied_values, &points_camera->buffer[ci * 9], sizeof(path_camera_applied_values));
+		path_camera_applied                = true;
 		scene_camera->base->transform->loc = (vec4_t){points_camera->buffer[ci * 9 + 0], points_camera->buffer[ci * 9 + 1], points_camera->buffer[ci * 9 + 2],
 		                                              points_camera->buffer[ci * 9 + 3]};
 		scene_camera->base->transform->rot = (quat_t){points_camera->buffer[ci * 9 + 4], points_camera->buffer[ci * 9 + 5], points_camera->buffer[ci * 9 + 6],
@@ -83,21 +201,73 @@ static void path_set_camera(f32_array_t *points_camera, i32 num_camera, i32 ci) 
 	}
 }
 
-static void path_paint(f32 px, f32 py, f32 *prev_px, f32 *prev_py) {
+static void path_paint(f32 px, f32 py, f32 *prev_px, f32 *prev_py, bool sphere_mode) {
+	// Re-evaluate the brush nodes for every stroke
+	// brush_output_node_parse_inputs();
+
 	g_context->decal_x          = px;
 	g_context->decal_y          = py;
 	g_context->paint_vec.x      = px;
 	g_context->paint_vec.y      = py;
-	g_context->last_paint_vec_x = *prev_px;
-	g_context->last_paint_vec_y = *prev_py;
+	g_context->last_paint_vec_x = sphere_mode ? px : *prev_px;
+	g_context->last_paint_vec_y = sphere_mode ? py : *prev_py;
 	g_context->pdirty           = 1;
 	render_path_paint_commands_paint(false);
 	*prev_px = px;
 	*prev_py = py;
 }
 
+static void path_flat_samples(f32 wx0, f32 wy0, f32 wz0, f32 wcx, f32 wcy, f32 wcz, f32 wx1, f32 wy1, f32 wz1, f32 max_len, bool *keep) {
+	f32    sx[18];
+	f32    sy[18];
+	f32    sl[18]; // Arc length
+	vec4_t prev = (vec4_t){wx0, wy0, wz0, 1.0f};
+	bool   ok   = true;
+	for (i32 s = 0; s <= 17; s++) {
+		f32    t = s / 17.0f;
+		vec4_t p = (vec4_t){bezier_eval(wx0, wcx, wx1, t), bezier_eval(wy0, wcy, wy1, t), bezier_eval(wz0, wcz, wz1, t), 1.0f};
+		keep[s]  = true;
+		ok       = project_to_screen(p, &sx[s], &sy[s]) && ok;
+		sx[s] *= sys_w();
+		sy[s] *= sys_h();
+		sl[s] = s == 0 ? 0.0f : sl[s - 1] + vec4_dist(p, prev);
+		prev  = p;
+	}
+	if (!ok) {
+		return;
+	}
+
+	f32 tol = 0.5f;
+	i32 a   = 0;
+	while (a < 17) {
+		// Extend the chord from sample a while the samples in between stay close to it
+		i32 b = a + 1;
+		while (b < 17 && sl[b + 1] - sl[a] <= max_len) {
+			f32  dx   = sx[b + 1] - sx[a];
+			f32  dy   = sy[b + 1] - sy[a];
+			f32  len2 = dx * dx + dy * dy;
+			bool flat = true;
+			for (i32 k = a + 1; k <= b && flat; k++) {
+				f32 px = sx[k] - sx[a];
+				f32 py = sy[k] - sy[a];
+				f32 u  = len2 > 0.0f ? (px * dx + py * dy) / len2 : 0.0f;
+				u      = u < 0.0f ? 0.0f : u > 1.0f ? 1.0f : u;
+				f32 ex = px - u * dx;
+				f32 ey = py - u * dy;
+				flat   = ex * ex + ey * ey <= tol * tol;
+			}
+			if (!flat) {
+				break;
+			}
+			keep[b] = false;
+			b++;
+		}
+		a = b;
+	}
+}
+
 static void path_paint_curved(f32_array_t *points, f32_array_t *points_world, f32_array_t *points_camera, i32_array_t *points_parent, i32 num_world,
-                              i32 num_camera, i32 num_parent, bool sphere_mode, f32 dot_spacing) {
+                              i32 num_camera, i32 num_parent, bool sphere_mode, f32 dot_spacing, f32 r_world, f32 *sl) {
 	f32 prev_px = 0.5f;
 	f32 prev_py = 0.5f;
 
@@ -109,7 +279,9 @@ static void path_paint_curved(f32_array_t *points, f32_array_t *points_world, f3
 	prev_py                     = pt0y;
 	g_context->prev_paint_vec_x = pt0x;
 	g_context->prev_paint_vec_y = pt0y;
-	path_paint(pt0x, pt0y, &prev_px, &prev_py);
+	vec4_t w_first              = path_point_world(points_world, 0);
+	path_segment_set(w_first, 0.0f, w_first, 0.0f);
+	path_paint(pt0x, pt0y, &prev_px, &prev_py, sphere_mode);
 
 	// Paint curve - anchor[p], control[j-1], anchor[j]
 	for (i32 j = 2; j < num_world; j += 2) {
@@ -126,6 +298,12 @@ static void path_paint_curved(f32_array_t *points, f32_array_t *points_world, f3
 		f32 wx1 = points_world->buffer[j * 3];
 		f32 wy1 = points_world->buffer[j * 3 + 1];
 		f32 wz1 = points_world->buffer[j * 3 + 2];
+
+		vec4_t w0 = path_point_world(points_world, p);
+		vec4_t wc = path_point_world(points_world, j - 1);
+		vec4_t w1 = path_point_world(points_world, j);
+		f32    s0 = sl[p];
+		f32    s1 = sl[j];
 
 		// Restore the start anchor camera and re-project its position as prev
 		if (p < num_camera) {
@@ -175,16 +353,30 @@ static void path_paint_curved(f32_array_t *points, f32_array_t *points_world, f3
 					g_context->prev_paint_vec_x = prev_px;
 					g_context->prev_paint_vec_y = prev_py;
 				}
-				f32 bx = ax1, by = ay1;
+				f32    bx = ax1, by = ay1;
+				vec4_t w  = (vec4_t){bwx, bwy, bwz, 0.0f};
+				f32    sg = slen[32] > 0.0f ? s0 + (s1 - s0) * tgt / slen[32] : s1;
+				path_segment_set(w, sg, w, sg);
 				project_to_screen((vec4_t){bwx, bwy, bwz, 1.0f}, &bx, &by);
-				path_paint(bx, by, &prev_px, &prev_py);
+				path_paint(bx, by, &prev_px, &prev_py, sphere_mode);
 				prev_bwx = bwx;
 				prev_bwy = bwy;
 				prev_bwz = bwz;
 			}
 		}
 		else { // Capsule
+			bool keep[18];
+			path_flat_samples(wx0, wy0, wz0, wcx, wcy, wcz, wx1, wy1, wz1, r_world * 4.0f, keep);
+			f32 warc[18]; // Arc length at each sample
+			warc[0] = 0.0f;
+			for (i32 k = 1; k <= 17; k++) {
+				warc[k] = warc[k - 1] + vec4_dist(bezier_eval_vec4(w0, wc, w1, k / 17.0f), bezier_eval_vec4(w0, wc, w1, (k - 1) / 17.0f));
+			}
+			i32 prev_s = 0;
 			for (i32 s = 1; s <= 17; s++) {
+				if (!keep[s]) {
+					continue;
+				}
 				f32 t   = s / 17.0f;
 				f32 bwx = bezier_eval(wx0, wcx, wx1, t);
 				f32 bwy = bezier_eval(wy0, wcy, wy1, t);
@@ -198,11 +390,15 @@ static void path_paint_curved(f32_array_t *points, f32_array_t *points_world, f3
 					g_context->prev_paint_vec_y = prev_py;
 				}
 				f32 bx = ax1, by = ay1;
+				f32 sa = warc[17] > 0.0f ? s0 + (s1 - s0) * warc[prev_s] / warc[17] : s0;
+				f32 sb = warc[17] > 0.0f ? s0 + (s1 - s0) * warc[s] / warc[17] : s1;
+				path_segment_set((vec4_t){prev_bwx, prev_bwy, prev_bwz, 0.0f}, sa, (vec4_t){bwx, bwy, bwz, 0.0f}, sb);
 				project_to_screen((vec4_t){bwx, bwy, bwz, 1.0f}, &bx, &by);
-				path_paint(bx, by, &prev_px, &prev_py);
+				path_paint(bx, by, &prev_px, &prev_py, sphere_mode);
 				prev_bwx = bwx;
 				prev_bwy = bwy;
 				prev_bwz = bwz;
+				prev_s   = s;
 			}
 		}
 	}
@@ -211,7 +407,7 @@ static void path_paint_curved(f32_array_t *points, f32_array_t *points_world, f3
 }
 
 static void path_paint_straight(f32_array_t *points, f32_array_t *points_world, f32_array_t *points_camera, i32_array_t *points_parent, i32 num_world,
-                                i32 num_camera, bool sphere_mode, f32 dot_spacing) {
+                                i32 num_camera, bool sphere_mode, f32 dot_spacing, f32 *sl) {
 	if (num_world > 0 && points->length >= 2) {
 		g_context->prev_paint_vec_x = points->buffer[0];
 		g_context->prev_paint_vec_y = points->buffer[1];
@@ -219,11 +415,14 @@ static void path_paint_straight(f32_array_t *points, f32_array_t *points_world, 
 	for (i32 i = 0; i < num_world; i++) {
 		path_set_camera(points_camera, num_camera, i);
 
-		f32 cur_px  = points->buffer[i * 2];
-		f32 cur_py  = points->buffer[i * 2 + 1];
-		f32 prev_px = cur_px;
-		f32 prev_py = cur_py;
-		i32 parent  = points_parent->buffer[i];
+		f32    cur_px  = points->buffer[i * 2];
+		f32    cur_py  = points->buffer[i * 2 + 1];
+		f32    prev_px = cur_px;
+		f32    prev_py = cur_py;
+		i32    parent  = points_parent->buffer[i];
+		vec4_t wcur    = path_point_world(points_world, i);
+		vec4_t wpar    = parent >= 0 ? path_point_world(points_world, parent) : wcur;
+		f32    spar    = parent >= 0 ? sl[parent] : sl[i];
 
 		if (sphere_mode && parent >= 0) {
 			f32 pwx = points_world->buffer[parent * 3];
@@ -251,7 +450,10 @@ static void path_paint_straight(f32_array_t *points, f32_array_t *points_world, 
 				f32 iwz = pwz + t * (cwz - pwz);
 				f32 ix = 0.0f, iy = 0.0f;
 				if (project_to_screen((vec4_t){iwx, iwy, iwz, 1.0f}, &ix, &iy)) {
-					path_paint(ix, iy, &prev_px, &prev_py);
+					vec4_t w  = vec4_add(wpar, vec4_mult(vec4_sub(wcur, wpar), t));
+					f32    sg = spar + t * (sl[i] - spar);
+					path_segment_set(w, sg, w, sg);
+					path_paint(ix, iy, &prev_px, &prev_py, sphere_mode);
 				}
 			}
 		}
@@ -262,9 +464,170 @@ static void path_paint_straight(f32_array_t *points, f32_array_t *points_world, 
 				f32 pwz = points_world->buffer[parent * 3 + 2];
 				project_to_screen((vec4_t){pwx, pwy, pwz, 1.0f}, &prev_px, &prev_py);
 			}
-			path_paint(cur_px, cur_py, &prev_px, &prev_py);
+			path_segment_set(wpar, spar, wcur, sl[i]);
+			path_paint(cur_px, cur_py, &prev_px, &prev_py, sphere_mode);
 		}
 	}
+
+	render_path_paint_dilate(true, true);
+}
+
+static void path_text_stamp(char *letter, f32 px, f32 py, f32 angle, f32 *prev_px, f32 *prev_py) {
+	g_context->text_tool_text = string_copy(letter);
+	util_render_make_text_preview();
+	g_context->brush_angle      = angle;
+	g_context->prev_paint_vec_x = px;
+	g_context->prev_paint_vec_y = py;
+	path_paint(px, py, prev_px, prev_py, true);
+}
+
+static void path_paint_text(slot_layer_t *l) {
+	f32_array_t *points        = l->path_points;
+	f32_array_t *points_world  = l->path_points_world;
+	f32_array_t *points_camera = l->path_points_camera;
+	i32_array_t *points_parent = l->path_points_parent;
+	i32          num_world     = points_world->length / 3;
+	i32          num_camera    = points_camera->length / 9;
+	i32          num_parent    = points_parent->length;
+
+	char *text = l->name;
+	i32   n    = 0; // Codepoint count
+	for (i32 i = 0; text[i] != '\0'; i++) {
+		if ((text[i] & 0xc0) != 0x80) {
+			n++;
+		}
+	}
+	if (n == 0) {
+		return;
+	}
+
+	char          *_text       = g_context->text_tool_text;
+	gpu_texture_t *_image      = g_context->text_tool_image;
+	g_context->text_tool_image = NULL;
+
+	f32 prev_px = 0.5f;
+	f32 prev_py = 0.5f;
+
+	if (num_world < 3) {
+		// Single anchor
+		path_set_camera(points_camera, num_camera, 0);
+		f32 px = points->length >= 2 ? points->buffer[0] : 0.5f;
+		f32 py = points->length >= 2 ? points->buffer[1] : 0.5f;
+		path_text_stamp(text, px, py, 0.0f, &prev_px, &prev_py);
+	}
+	else {
+		// Sample the bezier segments
+		i32 num_segments = (num_world - 1) / 2;
+		i32 num_samples  = num_segments * 32 + 1;
+
+		f32_array_t *spos = f32_array_create(num_samples * 3);
+		f32_array_t *slen = f32_array_create(num_samples);
+		i32_array_t *scam = i32_array_create(num_samples);
+
+		i32 si = 0;
+		for (i32 j = 2; j < num_world; j += 2) {
+			i32 p   = (j < num_parent) ? points_parent->buffer[j] : j - 2;
+			f32 wx0 = points_world->buffer[p * 3];
+			f32 wy0 = points_world->buffer[p * 3 + 1];
+			f32 wz0 = points_world->buffer[p * 3 + 2];
+			f32 wcx = points_world->buffer[(j - 1) * 3];
+			f32 wcy = points_world->buffer[(j - 1) * 3 + 1];
+			f32 wcz = points_world->buffer[(j - 1) * 3 + 2];
+			f32 wx1 = points_world->buffer[j * 3];
+			f32 wy1 = points_world->buffer[j * 3 + 1];
+			f32 wz1 = points_world->buffer[j * 3 + 2];
+
+			if (si == 0) {
+				spos->buffer[0] = wx0;
+				spos->buffer[1] = wy0;
+				spos->buffer[2] = wz0;
+				slen->buffer[0] = 0.0f;
+				scam->buffer[0] = p;
+				si              = 1;
+			}
+			for (i32 k = 1; k <= 32; k++) {
+				f32 kt                   = k / 32.0f;
+				f32 bwx                  = bezier_eval(wx0, wcx, wx1, kt);
+				f32 bwy                  = bezier_eval(wy0, wcy, wy1, kt);
+				f32 bwz                  = bezier_eval(wz0, wcz, wz1, kt);
+				f32 dx                   = bwx - spos->buffer[(si - 1) * 3];
+				f32 dy                   = bwy - spos->buffer[(si - 1) * 3 + 1];
+				f32 dz                   = bwz - spos->buffer[(si - 1) * 3 + 2];
+				spos->buffer[si * 3]     = bwx;
+				spos->buffer[si * 3 + 1] = bwy;
+				spos->buffer[si * 3 + 2] = bwz;
+				slen->buffer[si]         = slen->buffer[si - 1] + sqrtf(dx * dx + dy * dy + dz * dz);
+				scam->buffer[si]         = (k == 32 && j + 2 >= num_world) ? j : p;
+				si++;
+			}
+		}
+
+		f32 total   = slen->buffer[num_samples - 1];
+		f32 aspect  = sys_w() / (f32)sys_h();
+		i32 cur_cam = -1;
+		i32 byte_i  = 0;
+		for (i32 i = 0; i < n; i++) {
+			// Extract letter
+			i32 start = byte_i;
+			byte_i++;
+			while (text[byte_i] != '\0' && (text[byte_i] & 0xc0) == 0x80) {
+				byte_i++;
+			}
+			char letter[8];
+			i32  len_b = byte_i - start > 7 ? 7 : byte_i - start;
+			memcpy(letter, text + start, len_b);
+			letter[len_b] = '\0';
+			if (letter[0] == ' ' || letter[0] == '\t') {
+				continue;
+			}
+
+			// Evenly spaced along the arc
+			f32 target = n == 1 ? 0.0f : total * i / (f32)(n - 1);
+			i32 k      = 1;
+			while (k < num_samples - 1 && slen->buffer[k] < target) {
+				k++;
+			}
+			f32 d  = slen->buffer[k] - slen->buffer[k - 1];
+			f32 a  = d > 0.0f ? (target - slen->buffer[k - 1]) / d : 1.0f;
+			f32 wx = spos->buffer[(k - 1) * 3] + a * (spos->buffer[k * 3] - spos->buffer[(k - 1) * 3]);
+			f32 wy = spos->buffer[(k - 1) * 3 + 1] + a * (spos->buffer[k * 3 + 1] - spos->buffer[(k - 1) * 3 + 1]);
+			f32 wz = spos->buffer[(k - 1) * 3 + 2] + a * (spos->buffer[k * 3 + 2] - spos->buffer[(k - 1) * 3 + 2]);
+
+			i32 cam = scam->buffer[k];
+			if (cam != cur_cam) {
+				path_set_camera(points_camera, num_camera, cam);
+				cur_cam = cam;
+			}
+
+			f32 px, py;
+			if (!project_to_screen((vec4_t){wx, wy, wz, 1.0f}, &px, &py)) {
+				continue;
+			}
+
+			// Rotate the letter
+			f32 ax, ay, bx, by;
+			f32 angle = 0.0f;
+			if (project_to_screen((vec4_t){spos->buffer[(k - 1) * 3], spos->buffer[(k - 1) * 3 + 1], spos->buffer[(k - 1) * 3 + 2], 1.0f}, &ax, &ay) &&
+			    project_to_screen((vec4_t){spos->buffer[k * 3], spos->buffer[k * 3 + 1], spos->buffer[k * 3 + 2], 1.0f}, &bx, &by)) {
+				angle = -atan2f(-(by - ay), (bx - ax) * aspect) * (180.0f / math_pi());
+			}
+
+			path_text_stamp(letter, px, py, angle, &prev_px, &prev_py);
+		}
+
+		array_free(spos);
+		free(spos);
+		array_free(slen);
+		free(slen);
+		array_free(scam);
+		free(scam);
+	}
+
+	if (g_context->text_tool_image != NULL) {
+		gpu_delete_texture(g_context->text_tool_image);
+	}
+	g_context->text_tool_text  = _text;
+	g_context->text_tool_image = _image;
 
 	render_path_paint_dilate(true, true);
 }
@@ -274,50 +637,73 @@ static void path_repaint(slot_layer_t *l) {
 		return;
 	}
 	f32_array_t *points_world = l->path_points_world;
-	if (points_world == NULL || points_world->length == 0) {
+	if (points_world == NULL) {
 		return;
 	}
 
-	slot_layer_t    *_layer     = g_context->layer;
-	slot_material_t *_material  = g_context->material;
-	tool_type_t      _tool      = g_context->tool;
-	f32              _last_x    = g_context->last_paint_vec_x;
-	f32              _last_y    = g_context->last_paint_vec_y;
-	vec4_t           _paint_vec = g_context->paint_vec;
-	g_context->layer            = l;
-	g_context->material         = l->path_material;
-	g_context->tool             = l->path_tool;
+	slot_layer_t    *_layer       = g_context->layer;
+	slot_material_t *_material    = g_context->material;
+	tool_type_t      _tool        = g_context->tool;
+	f32              _last_x      = g_context->last_paint_vec_x;
+	f32              _last_y      = g_context->last_paint_vec_y;
+	vec4_t           _paint_vec   = g_context->paint_vec;
+	f32              _brush_angle = g_context->brush_angle;
+	g_context->layer              = l;
+	g_context->material           = l->path_material;
+	g_context->tool               = l->path_tool;
+	if (l->path_text) {
+		// Add rotation uniform to paint shader
+		g_context->brush_angle = 0.001f;
+	}
 
 	make_material_save_paint_material();
 	make_material_parse_paint_material(false);
 	layers_set_object_mask();
 
-	slot_layer_clear(l, 0x00000000, NULL, 1.0, layers_default_rough, 0.0);
+	path_clear_layer(l);
 
-	if (l->texpaint_sculpt != NULL) {
-		// Restore the undeformed base mesh
-		sculpt_import_mesh_pack_to_texture(l->texpaint_sculpt);
-	}
-
-	vec4_t _camera_loc = scene_camera->base->transform->loc;
-	quat_t _camera_rot = scene_camera->base->transform->rot;
+	vec4_t _camera_loc  = scene_camera->base->transform->loc;
+	quat_t _camera_rot  = scene_camera->base->transform->rot;
+	path_camera_applied = false;
 
 	f32_array_t *points        = l->path_points;
 	f32_array_t *points_camera = l->path_points_camera;
 	i32_array_t *points_parent = l->path_points_parent;
-	i32          num_world     = points_world->length / 3;
-	i32          num_camera    = points_camera->length / 9;
-	i32          num_parent    = points_parent->length;
-	bool         sphere_mode   = g_context->brush_lazy_radius > 0 && g_context->brush_lazy_step > 0;
+	// Drop points left without a screen position by scripts shortening path_points
+	i32 num_points = points->length / 2;
+	if (points_world->length > num_points * 3) {
+		points_world->length = num_points * 3;
+	}
+	if (points_camera->length > num_points * 9) {
+		points_camera->length = num_points * 9;
+	}
+	if (points_parent->length > num_points) {
+		points_parent->length = num_points;
+	}
+	i32  num_world   = points_world->length / 3;
+	i32  num_camera  = points_camera->length / 9;
+	i32  num_parent  = points_parent->length;
+	bool sphere_mode = g_context->brush_lazy_radius > 0 && g_context->brush_lazy_step > 0;
 	// Spacing in world units
 	f32 r_world     = g_context->brush_radius * g_context->brush_nodes_radius / 15.0f * 2.0f;
 	f32 dot_spacing = sphere_mode ? g_context->brush_lazy_radius * g_context->brush_lazy_step * r_world * 3.0 : 0.0f;
 
-	if (l->path_curved && num_world >= 1) {
-		path_paint_curved(points, points_world, points_camera, points_parent, num_world, num_camera, num_parent, sphere_mode, dot_spacing);
-	}
-	else {
-		path_paint_straight(points, points_world, points_camera, points_parent, num_world, num_camera, sphere_mode, dot_spacing);
+	if (num_world >= 1) {
+		if (l->path_text) {
+			path_paint_text(l);
+		}
+		else {
+			f32 *sl             = path_arc_lengths(points_world, points_parent, num_world, num_parent, l->path_curved);
+			path_segment_active = true;
+			if (l->path_curved) {
+				path_paint_curved(points, points_world, points_camera, points_parent, num_world, num_camera, num_parent, sphere_mode, dot_spacing, r_world, sl);
+			}
+			else {
+				path_paint_straight(points, points_world, points_camera, points_parent, num_world, num_camera, sphere_mode, dot_spacing, sl);
+			}
+			path_segment_active = false;
+			free(sl);
+		}
 	}
 
 	scene_camera->base->transform->loc = _camera_loc;
@@ -328,13 +714,13 @@ static void path_repaint(slot_layer_t *l) {
 
 	g_context->pdirty           = 0;
 	g_context->rtdirty          = 1;
-	g_context->rdirty           = 2;
 	g_context->tool             = _tool;
 	g_context->layer            = _layer;
 	g_context->material         = _material;
 	g_context->last_paint_vec_x = _last_x;
 	g_context->last_paint_vec_y = _last_y;
 	g_context->paint_vec        = _paint_vec;
+	g_context->brush_angle      = _brush_angle;
 	make_material_restore_paint_material();
 }
 
@@ -346,22 +732,121 @@ void util_layer_clear_path_points(slot_layer_t *l) {
 	l->path_points_world->length  = 0;
 	l->path_points_camera->length = 0;
 	l->path_points_parent->length = 0;
-	l->path_tool                  = -1;
+	l->path_tool                  = l->path_text ? TOOL_TYPE_TEXT : -1;
 	path_layer_last_active        = -1;
+}
+
+static void path_array_remove_f32(f32_array_t *ar, i32 stride, i32 start, i32 count) {
+	i32 n = ar->length / stride;
+	if (start >= n) {
+		return;
+	}
+	if (start + count > n) {
+		count = n - start;
+	}
+	i32 tail = (n - start - count) * stride;
+	if (tail > 0) {
+		memmove(&ar->buffer[start * stride], &ar->buffer[(start + count) * stride], tail * sizeof(f32));
+	}
+	ar->length -= count * stride;
+}
+
+static void path_array_remove_i32(i32_array_t *ar, i32 start, i32 count) {
+	i32 n = ar->length;
+	if (start >= n) {
+		return;
+	}
+	if (start + count > n) {
+		count = n - start;
+	}
+	i32 tail = n - start - count;
+	if (tail > 0) {
+		memmove(&ar->buffer[start], &ar->buffer[start + count], tail * sizeof(i32));
+	}
+	ar->length -= count;
+}
+
+void util_layer_remove_path_point(slot_layer_t *l) {
+	if (!slot_layer_is_path(l)) {
+		return;
+	}
+
+	i32 num_points = l->path_points->length / 2;
+	i32 idx        = path_layer_last_active;
+	if (idx < 0 || idx >= num_points) {
+		return;
+	}
+
+	// Anchors sit at even indices, their control points at the odd index before them
+	i32 start = idx;
+	i32 count = 1;
+	if (l->path_curved) {
+		if (idx % 2 == 1) {
+			// Control point - remove the anchor it belongs to as well
+			start = idx;
+			count = idx + 1 < num_points ? 2 : 1;
+		}
+		else if (idx > 0) {
+			start = idx - 1;
+			count = 2;
+		}
+		else {
+			start = 0;
+			count = num_points > 1 ? 2 : 1;
+		}
+	}
+
+	i32_array_t *points_parent = l->path_points_parent;
+	i32          last          = start + count - 1;
+	i32          new_parent    = last < (i32)points_parent->length ? points_parent->buffer[last] : -1;
+	if (new_parent >= start && new_parent <= last) {
+		new_parent = -1;
+	}
+	else if (new_parent > last) {
+		new_parent -= count;
+	}
+
+	// Reparent orphaned points and shift the indices of the remaining ones
+	for (i32 i = 0; i < (i32)points_parent->length; i++) {
+		i32 p = points_parent->buffer[i];
+		if (p >= start && p <= last) {
+			p = new_parent;
+		}
+		else if (p > last) {
+			p -= count;
+		}
+		points_parent->buffer[i] = p;
+	}
+
+	path_array_remove_f32(l->path_points, 2, start, count);
+	path_array_remove_f32(l->path_points_world, 3, start, count);
+	path_array_remove_f32(l->path_points_camera, 9, start, count);
+	path_array_remove_i32(points_parent, start, count);
+
+	i32 left               = l->path_points->length / 2;
+	path_layer_last_active = left > 0 ? (new_parent >= 0 ? new_parent : left - 1) : -1;
+	path_point_dragging    = -1;
+
+	util_layer_repaint_path(l);
+
+	if (left == 0) {
+		util_layer_clear_path_points(l);
+	}
+
+	g_context->layer_preview_dirty  = true;
+	g_context->layers_preview_dirty = true;
 }
 
 void util_layer_add_path_point(slot_layer_t *l, f32 screen_x, f32 screen_y) {
 	if (l->path_tool == -1) {
 		l->path_tool = g_context->tool;
 	}
-	if ((i32)g_context->tool != l->path_tool) {
+	if (!l->path_text && (i32)g_context->tool != l->path_tool) {
 		return;
 	}
 
 	bool _paint2d = g_context->paint2d;
 	if (_paint2d) {
-		// Convert 2D view x-coordinate [1, 1+ww/base_w] to 3D range [0, 1]
-		screen_x = (screen_x * base_w() - base_w()) / (float)ui_view2d_ww;
 		render_path_paint_set_plane_mesh();
 		g_context->paint2d = false;
 	}
@@ -408,7 +893,11 @@ void util_layer_add_path_point(slot_layer_t *l, f32 screen_x, f32 screen_y) {
 	i32 new_index          = points->length / 2 - 1;
 	path_layer_last_active = new_index;
 
-	path_repaint(l);
+	// A curve control point is not painted until its anchor is added
+	if (!l->path_curved || new_index % 2 == 0) {
+		path_repaint(l);
+		nodes_mesh_layer_changed(l);
+	}
 
 	for (i32 j = 0; j < path_point_sphere_count; j++) {
 		path_point_spheres[j]->visible = true;
@@ -428,6 +917,7 @@ void util_layer_repaint_path(slot_layer_t *l) {
 	for (i32 j = 0; j < path_point_sphere_count; j++) {
 		path_point_spheres[j]->visible = true;
 	}
+	nodes_mesh_layer_changed(l); // Mesh layer mask nodes, rebuilt once the drag ends
 }
 
 static void path_point_move(slot_layer_t *l, i32 idx, f32 new_x, f32 new_y) {
@@ -447,7 +937,7 @@ static void path_point_move(slot_layer_t *l, i32 idx, f32 new_x, f32 new_y) {
 	g_context->paint_vec.x = saved_pvx;
 	g_context->paint_vec.y = saved_pvy;
 
-	if (math_abs(g_context->posx_picked) < 50.0f) {
+	if (util_render_picked_on_mesh()) {
 		points_world->buffer[idx * 3]     = g_context->posx_picked;
 		points_world->buffer[idx * 3 + 1] = g_context->posy_picked;
 		points_world->buffer[idx * 3 + 2] = g_context->posz_picked;
@@ -469,12 +959,12 @@ static void path_point_move(slot_layer_t *l, i32 idx, f32 new_x, f32 new_y) {
 
 void util_layer_check_path_grab() {
 	// Check if mouse ray hits any point sphere
-	if (g_config->workspace == WORKSPACE_PLAYER || g_context->paint2d) {
+	if (base_player || g_context->paint2d) {
 		return;
 	}
 
 	slot_layer_t *l = g_context->layer;
-	if (!slot_layer_is_path(l)) {
+	if (!slot_layer_is_path(l) || !slot_layer_is_visible(l)) {
 		return;
 	}
 
@@ -512,12 +1002,12 @@ void util_layer_check_path_grab() {
 }
 
 void util_layer_update_path() {
-	if (g_config->workspace == WORKSPACE_PLAYER || g_context->paint2d) {
+	if (base_player || g_context->paint2d) {
 		return;
 	}
 
 	slot_layer_t *l       = g_context->layer;
-	bool          is_path = slot_layer_is_path(l);
+	bool          is_path = slot_layer_is_path(l) && slot_layer_is_visible(l);
 
 	// Clear spheres when switching away from path layer
 	if (path_layer_current != l || !is_path) {
@@ -536,6 +1026,11 @@ void util_layer_update_path() {
 		return;
 	}
 
+	bool object_tool = g_context->tool == TOOL_TYPE_PATH || g_context->tool == TOOL_TYPE_CURVE; // Removes its own points
+	if (keyboard_started("delete") && !g_ui->is_typing && context_in_3d_view() && !object_tool) {
+		util_layer_remove_path_point(l);
+	}
+
 	f32_array_t *points       = l->path_points;
 	f32_array_t *points_world = l->path_points_world;
 	i32          num_points   = points->length / 2;
@@ -550,10 +1045,11 @@ void util_layer_update_path() {
 		}
 	}
 	else if (vis_points > path_point_sphere_count) {
-		path_point_spheres = (object_t **)gc_realloc(path_point_spheres, vis_points * sizeof(object_t *));
-		gc_root(path_point_spheres);
+		path_point_spheres = (object_t **)realloc(path_point_spheres, vis_points * sizeof(object_t *));
 		for (i32 i = path_point_sphere_count; i < vis_points; i++) {
-			object_t *o           = scene_spawn_object(".Sphere", NULL, true);
+			object_t      *o      = scene_spawn_object(".Sphere", NULL, true);
+			mesh_object_t *mo     = o->ext;
+			mo->material          = make_particle_get_bullet_material();
 			o->visible            = true;
 			path_point_spheres[i] = o;
 		}
@@ -582,8 +1078,9 @@ void util_layer_update_path() {
 		for (i32 j = 0; j < path_point_sphere_count; j++) {
 			path_point_spheres[j]->visible = true;
 		}
-		path_layer_last_active          = path_point_dragging;
-		path_point_dragging             = -1;
+		path_layer_last_active = path_point_dragging;
+		path_point_dragging    = -1;
+		path_free_sculpt_rest();
 		g_context->layer_preview_dirty  = true;
 		g_context->layers_preview_dirty = true;
 	}

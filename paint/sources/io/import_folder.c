@@ -7,7 +7,7 @@ void import_folder_place_image_node(ui_nodes_t *nodes, ui_node_canvas_t *canvas,
 	n->x                                 = 72;
 	n->y                                 = ny;
 	ui_node_link_t *l =
-	    GC_ALLOC_INIT(ui_node_link_t, {.id = ui_next_link_id(canvas->links), .from_id = n->id, .from_socket = 0, .to_id = to_id, .to_socket = to_socket});
+	    ALLOC_INIT(ui_node_link_t, {.id = ui_next_link_id(canvas->links), .from_id = n->id, .from_socket = 0, .to_id = to_id, .to_socket = to_socket});
 	any_array_push(canvas->links, l);
 }
 
@@ -77,7 +77,7 @@ void import_folder_run(char *path) {
 	ui_nodes_t       *nodes  = g_context->material->nodes;
 	ui_node_canvas_t *canvas = g_context->material->canvas;
 	string_array_t   *dirs   = string_split(path, PATH_SEP);
-	canvas->name             = string_copy(dirs->buffer[dirs->length - 1]);
+	canvas->name             = string_copy(slot_material_unique_name(canvas, dirs->buffer[dirs->length - 1]));
 	ui_node_t *nout          = NULL;
 	for (i32 i = 0; i < canvas->nodes->length; ++i) {
 		ui_node_t *n = canvas->nodes->buffer[i];
@@ -129,6 +129,6 @@ void import_folder_run(char *path) {
 
 	make_material_parse_paint_material(true);
 	util_render_make_material_preview();
-	ui_base_hwnds->buffer[1]->redraws = 2;
+	ui_dock_redraw(1);
 	history_new_material();
 }

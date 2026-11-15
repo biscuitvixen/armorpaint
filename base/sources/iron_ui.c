@@ -1,7 +1,7 @@
 #include "iron_ui.h"
+#include "iron_alloc.h"
 #include "iron_draw.h"
 #include "iron_file.h"
-#include "iron_gc.h"
 #include "iron_gpu.h"
 #include "iron_string.h"
 #include "iron_system.h"
@@ -12,27 +12,30 @@
 #include <stdlib.h>
 #include <string.h>
 
-static ui_t        *current = NULL;
-static ui_theme_t  *theme;
-static bool         ui_key_repeat         = true; // Emulate key repeat for non-character keys
-static bool         ui_dynamic_glyph_load = true; // Allow text input fields to push new glyphs into the font atlas
-static float        ui_key_repeat_time    = 0.0;
-char                ui_text_to_paste[8192];
-char                ui_text_to_copy[8192];
-static bool         ui_combo_first         = true;
-static ui_handle_t *ui_combo_search_handle = NULL;
-static int          touch_hold_x           = -1;
-static int          touch_hold_y           = -1;
+static ui_t       *current = NULL;
+static ui_theme_t *theme;
+static bool        ui_key_repeat         = true; // Emulate key repeat for non-character keys
+static bool        ui_dynamic_glyph_load = true; // Allow text input fields to push new glyphs into the font atlas
+static float       ui_key_repeat_time    = 0.0;
+char               ui_text_to_paste[UI_TEXT_MAX];
+char               ui_text_to_copy[UI_TEXT_MAX];
+static void        ui_start_edit(ui_id_t id, const char *text, int align);
+
+static int touch_hold_x = -1;
+static int touch_hold_y = -1;
 // Pan with finger to scroll
 // Touch and hold finger for right click
 // Show extra tooltips above finger / on-screen keyboard
-bool  ui_touch_control                                         = false;
-float ui_touch_speed                                           = 1.0;
-bool  ui_is_cut                                                = false;
-bool  ui_is_copy                                               = false;
-bool  ui_is_paste                                              = false;
-void (*ui_on_border_hover)(ui_handle_t *, int)                 = NULL; // Mouse over window border, use for resizing
-void (*ui_on_tab_drop)(ui_handle_t *, int, ui_handle_t *, int) = NULL; // Tab reorder via drag and drop
+bool  ui_touch_control                         = false;
+bool  ui_tooltips                              = true;
+float ui_touch_speed                           = 1.0;
+bool  ui_is_cut                                = false;
+bool  ui_is_copy                               = false;
+bool  ui_is_paste                              = false;
+void (*ui_on_border_hover)(ui_window_t *, int) = NULL; // Mouse over window border, use for resizing
+void (*ui_on_tab_drop)(int *, int, int *, int) = NULL; // Tab reorder via drag and drop
+void (*ui_on_tab_context_menu)(int *, int)     = NULL; // Tab name was right clicked
+bool (*ui_on_tab_dock)(int *)                  = NULL; // Tab group takes part in drag and drop, all groups do when not set
 #ifdef WITH_EVAL
 #include "libs/minic.h"
 #endif
@@ -54,6 +57,10 @@ float UI_ELEMENT_W() {
 
 float UI_ELEMENT_H() {
 	return theme->ELEMENT_H * UI_SCALE();
+}
+
+float UI_TEXT_AREA_LINE_H() {
+	return (int)(theme->ELEMENT_H * 0.85) * UI_SCALE();
 }
 
 float UI_ELEMENT_OFFSET() {
@@ -113,31 +120,75 @@ void ui_set_current(ui_t *_current) {
 	theme   = current->ops->theme;
 }
 
-ui_handle_t *ui_handle_create() {
-	ui_handle_t *h = (ui_handle_t *)gc_alloc(sizeof(ui_handle_t));
-	memset(h, 0, sizeof(ui_handle_t));
-	h->redraws = 2;
-	h->color   = 0xffffffff;
-	h->text    = "";
-	h->init    = true;
-	return h;
+static ui_id_t ui_mix_id(ui_id_t a, ui_id_t b) {
+	return (a ^ b) * (ui_id_t)1099511628211ULL;
 }
 
-ui_handle_t *ui_nest(ui_handle_t *handle, int pos) {
-	if (handle->children == NULL) {
-		handle->children = any_array_create(0);
-	}
-	while (pos >= handle->children->length) {
-		ui_handle_t *h = ui_handle_create();
-		any_array_push(handle->children, h);
-		if (pos == handle->children->length - 1) {
-			// Return now so init stays true
-			return h;
+ui_id_t ui_widget_id(const void *value, int kind) {
+	ui_id_t id = ui_mix_id((ui_id_t)current->current_window, (ui_id_t)kind);
+	if (current->id_depth > 0)
+		id = ui_mix_id(id, current->id_stack[current->id_depth - 1]);
+	id = ui_mix_id(id, current->next_id != 0 ? current->next_id : (ui_id_t)value);
+	return id != 0 ? id : 1;
+}
+
+void ui_push_id(ui_id_t id) {
+	assert(current->id_depth < 32);
+	current->id_stack[current->id_depth] = ui_mix_id(current->id_depth > 0 ? current->id_stack[current->id_depth - 1] : 0, id);
+	current->id_depth++;
+}
+
+void ui_pop_id(void) {
+	assert(current->id_depth > 0);
+	current->id_depth--;
+}
+
+void ui_set_next_id(ui_id_t id) {
+	current->next_id = id;
+}
+bool ui_item_changed(void) {
+	return current->item_changed;
+}
+
+void ui_record_change(void) {
+	current->changed |= current->item_changed;
+	current->next_id = 0;
+}
+
+ui_window_t *ui_window_create(void) {
+	ui_window_t *window = calloc(1, sizeof(*window));
+	window->redraws     = 2;
+	return window;
+}
+
+void ui_window_destroy(ui_window_t *window) {
+	if (current != NULL) {
+		if (current->current_window == window) {
+			current->current_window     = NULL;
+			current->window_ended       = true;
+			current->tab_state          = NULL;
+			current->tab_handle         = NULL;
+			current->tab_scroll_pending = false;
+		}
+		if (current->scroll_handle == window)
+			current->scroll_handle = NULL;
+		if (current->drag_handle == window)
+			current->drag_handle = NULL;
+		if (current->combo_selected_window == window) {
+			current->combo_selected_window = NULL;
+			current->combo_selected_id     = 0;
+			current->submit_combo_id       = 0;
+			current->input_enabled         = true;
 		}
 	}
-	// This handle already exists, set init to false
-	handle->children->buffer[pos]->init = false;
-	return handle->children->buffer[pos];
+	if (window->texture.width != 0)
+		gpu_texture_destroy(&window->texture);
+	while (window->tabs != NULL) {
+		ui_tab_state_t *next = window->tabs->next;
+		free(window->tabs);
+		window->tabs = next;
+	}
+	memset(window, 0, sizeof(*window));
 }
 
 void ui_fade_color(float alpha) {
@@ -167,13 +218,177 @@ void ui_rect(float x, float y, float w, float h, uint32_t color, float strength)
 	draw_set_color(0xffffffff);
 }
 
+static void ui_bake_round_corner(gpu_texture_t *tex, int size, float ro, float ri) {
+	uint8_t *pixels = (uint8_t *)malloc(size * size * 4);
+	for (int y = 0; y < size; ++y) {
+		for (int x = 0; x < size; ++x) {
+			float dx = size - (x + 0.5);
+			float dy = size - (y + 0.5);
+			float d  = sqrtf(dx * dx + dy * dy);
+			float a  = fmin(fmax(ro - d + 0.5, 0.0), 1.0);
+			if (ri >= 0.0) {
+				a -= fmin(fmax(ri - d + 0.5, 0.0), 1.0);
+			}
+			uint8_t *p = pixels + (y * size + x) * 4;
+			p[0] = p[1] = p[2] = 255;
+			p[3]               = (uint8_t)(a * 255.0 + 0.5);
+		}
+	}
+	gpu_texture_init_from_bytes(tex, pixels, size, size, GPU_TEXTURE_FORMAT_RGBA32, false);
+	free(pixels);
+}
+
+static void ui_bake_circle(gpu_texture_t *tex, int size, float ro, float ri) {
+	uint8_t *pixels = (uint8_t *)malloc(size * size * 4);
+	for (int y = 0; y < size; ++y) {
+		for (int x = 0; x < size; ++x) {
+			float    dx = size / 2.0 - (x + 0.5);
+			float    dy = size / 2.0 - (y + 0.5);
+			float    d  = sqrtf(dx * dx + dy * dy);
+			float    a  = fmin(fmax(ro - d + 0.5, 0.0), 1.0);
+			float    in = fmin(fmax(ri - d + 0.5, 0.0), 1.0);
+			uint8_t *p  = pixels + (y * size + x) * 4;
+			p[0] = p[1] = p[2] = (uint8_t)(255.0 - 85.0 * in + 0.5);
+			p[3]               = (uint8_t)(a * 255.0 + 0.5);
+		}
+	}
+	gpu_texture_init_from_bytes(tex, pixels, size, size, GPU_TEXTURE_FORMAT_RGBA32, false);
+	free(pixels);
+}
+
+static float ui_segment_dist(float px, float py, float x0, float y0, float x1, float y1) {
+	float vx = x1 - x0;
+	float vy = y1 - y0;
+	float t  = ((px - x0) * vx + (py - y0) * vy) / (vx * vx + vy * vy);
+	t        = fmin(fmax(t, 0.0), 1.0);
+	float dx = px - (x0 + vx * t);
+	float dy = py - (y0 + vy * t);
+	return sqrtf(dx * dx + dy * dy);
+}
+
+static void ui_bake_check(gpu_texture_t *tex, int size, float x0, float y0, float x1, float y1, float x2, float y2, float hs) {
+	uint8_t *pixels = (uint8_t *)malloc(size * size * 4);
+	for (int y = 0; y < size; ++y) {
+		for (int x = 0; x < size; ++x) {
+			float    d = fmin(ui_segment_dist(x + 0.5, y + 0.5, x0, y0, x1, y1), ui_segment_dist(x + 0.5, y + 0.5, x1, y1, x2, y2));
+			float    a = fmin(fmax(hs - d + 0.5, 0.0), 1.0);
+			uint8_t *p = pixels + (y * size + x) * 4;
+			p[0] = p[1] = p[2] = 255;
+			p[3]               = (uint8_t)(a * 255.0 + 0.5);
+		}
+	}
+	gpu_texture_init_from_bytes(tex, pixels, size, size, GPU_TEXTURE_FORMAT_RGBA32, false);
+	free(pixels);
+}
+
+static void ui_bake_shadow(gpu_texture_t *tex, int size, float rc) {
+	uint8_t *pixels = (uint8_t *)malloc(size * size * 4);
+	for (int y = 0; y < size; ++y) {
+		for (int x = 0; x < size; ++x) {
+			float    d = sqrtf((x + 0.5) * (x + 0.5) + (y + 0.5) * (y + 0.5));
+			float    t = fmin(fmax((d - rc) / (size - rc), 0.0), 1.0);
+			uint8_t *p = pixels + (y * size + x) * 4;
+			p[0] = p[1] = p[2] = 0;
+			p[3]               = (uint8_t)((1.0 - t) * (1.0 - t) * 255.0 + 0.5);
+		}
+	}
+	gpu_texture_init_from_bytes(tex, pixels, size, size, GPU_TEXTURE_FORMAT_RGBA32, false);
+	free(pixels);
+}
+
+#define UI_ROUND_CACHE_SIZE 8
+
+typedef struct ui_round_cache {
+	int           r;
+	int           s;
+	gpu_texture_t image;
+} ui_round_cache_t;
+
+static ui_round_cache_t ui_round_cache[UI_ROUND_CACHE_SIZE];
+static int              ui_round_cache_next = 0;
+
+static gpu_texture_t *ui_get_round_corner(int r, int s) {
+	for (int i = 0; i < UI_ROUND_CACHE_SIZE; ++i) {
+		if (ui_round_cache[i].r == r && ui_round_cache[i].s == s) {
+			return &ui_round_cache[i].image;
+		}
+	}
+	draw_flush();
+	ui_round_cache_t *c = &ui_round_cache[ui_round_cache_next];
+	ui_round_cache_next = (ui_round_cache_next + 1) % UI_ROUND_CACHE_SIZE;
+	if (c->image.width != 0) {
+		gpu_texture_destroy(&c->image);
+	}
+	c->r = r;
+	c->s = s;
+	ui_bake_round_corner(&c->image, r, r, r - s);
+	return &c->image;
+}
+
+void ui_rect_round(float x, float y, float w, float h, uint32_t color, float strength) {
+	draw_set_color(color);
+	if (!current->enabled) {
+		ui_fade_color(0.25);
+	}
+	int s  = (int)(strength + 0.5);
+	int rx = (int)(current->_x + x * UI_SCALE() - strength / 2.0);
+	int ry = (int)(current->_y + y * UI_SCALE() - strength / 2.0);
+	int rw = (int)(w * UI_SCALE() + strength);
+	int rh = (int)(h * UI_SCALE() + strength);
+	int r  = (int)(4.0 * UI_SCALE() + strength / 2.0 + 0.5);
+	if (s < 1) {
+		s = 1;
+	}
+	if (r > rw / 2) {
+		r = rw / 2;
+	}
+	if (r > rh / 2) {
+		r = rh / 2;
+	}
+	if (r > 0) {
+		gpu_texture_t *corner = ui_get_round_corner(r, s);
+		draw_scaled_image(corner, rx, ry, r, r);
+		draw_scaled_image(corner, rx, ry + rh, r, -r);
+		draw_scaled_image(corner, rx + rw, ry, -r, r);
+		draw_scaled_image(corner, rx + rw, ry + rh, -r, -r);
+	}
+	draw_filled_rect(rx + r, ry, rw - r * 2, s);
+	draw_filled_rect(rx + r, ry + rh - s, rw - r * 2, s);
+	draw_filled_rect(rx, ry + r, s, rh - r * 2);
+	draw_filled_rect(rx + rw - s, ry + r, s, rh - r * 2);
+	draw_set_color(0xffffffff);
+}
+
 void ui_draw_shadow(float x, float y, float w, float h) {
-	float max_offset = 16.0 * UI_SCALE();
-	for (int i = 0; i < 6; i++) {
-		float offset = (max_offset / 6) * (i + 1);
-		float a      = 0.04 - (0.04 / 6) * i;
-		draw_set_color(((uint8_t)(a * 255) << 24) | (0 << 16) | (0 << 8) | 0);
-		ui_draw_rect(true, false, x - offset, y, w + offset * 2, h + offset);
+	gpu_texture_t *img = &current->shadow_image;
+	int            t   = img->width;
+	if (t == 0) {
+		return;
+	}
+	int r  = current->filled_round_corner_image.width;
+	int xl = (int)x + r;
+	int xr = (int)(x + w) - r;
+	int yb = (int)(y + h) - r;
+	int yt = (int)y + t / 2;
+	if (yt > yb) {
+		yt = yb;
+	}
+	if (xl > xr) {
+		xl = xr = (int)(x + w / 2.0);
+	}
+	int   ht = yt - (int)y;
+	float e  = t - 1.0;
+	draw_set_color(0x24000000);
+	draw_scaled_sub_image(img, 0.5, 0.5, e, e, xr, yb, t, t);
+	draw_scaled_sub_image(img, 0.5, 0.5, e, e, xl, yb, -t, t);
+	draw_scaled_sub_image(img, 0.5, 0.5, 0, e, xl, yb, xr - xl, t);
+	draw_scaled_sub_image(img, 0.5, 0.5, e, 0, xr, yt, t, yb - yt);
+	draw_scaled_sub_image(img, 0.5, 0.5, e, 0, xl, yt, -t, yb - yt);
+	draw_scaled_sub_image(img, 0.5, 0.5, 0, 0, xl, yt, xr - xl, yb - yt);
+	if (ht > 0) {
+		draw_scaled_sub_image(img, 0.5, 0.5, e, e, xr, yt, t, -ht);
+		draw_scaled_sub_image(img, 0.5, 0.5, e, e, xl, yt, -t, -ht);
+		draw_scaled_sub_image(img, 0.5, 0.5, 0, e, xl, yt, xr - xl, -ht);
 	}
 }
 
@@ -254,8 +469,10 @@ void ui_draw_round_bottom(float x, float y, float w) {
 }
 
 bool ui_is_char(int code) {
-	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code == '_';
 }
+
+void (*ui_text_coloring_draw)(char *text, char *rest, float x, float y) = NULL;
 
 int ui_check_start(int i, char *text, char **start, int start_count) {
 	for (int x = 0; x < start_count; ++x) {
@@ -323,10 +540,14 @@ void ui_draw_string(char *text, float x_offset, float y_offset, int align, bool 
 		return;
 	}
 	if (truncation) {
-		assert(strlen(text) < 1024 - 2);
-		char *full_text = text;
-		strcpy(truncated, text);
-		text = &truncated[0];
+		char  *full_text = text;
+		size_t len       = strlen(text);
+		if (len > sizeof(truncated) - 3) {
+			len = sizeof(truncated) - 3;
+		}
+		memcpy(truncated, text, len);
+		truncated[len] = '\0';
+		text           = &truncated[0];
 		while (strlen(text) > 0 && draw_string_width(current->ops->font, current->font_size, text) > current->_w - 6.0 * UI_SCALE()) {
 			text[strlen(text) - 1] = 0;
 		}
@@ -344,10 +565,11 @@ void ui_draw_string(char *text, float x_offset, float y_offset, int align, bool 
 	}
 
 	if (ui_dynamic_glyph_load) {
-		int len = strlen(text);
-		for (int i = 0; i < len; ++i) {
-			if (text[i] > 126 && !draw_font_has_glyph((int)text[i])) {
-				int glyph = text[i];
+		for (int i = 0; text[i] != '\0';) {
+			int l     = 0;
+			int glyph = string_utf8_decode(&text[i], &l);
+			i += l > 0 ? l : 1;
+			if (glyph > 126 && !draw_font_has_glyph(glyph)) {
 				draw_font_add_glyph(glyph);
 			}
 		}
@@ -383,6 +605,9 @@ void ui_draw_string(char *text, float x_offset, float y_offset, int align, bool 
 				draw_string(result.colored, current->_x + x_offset, current->_y + current->font_offset_y + y_offset);
 			}
 			strcpy(temp, result.uncolored);
+		}
+		if (ui_text_coloring_draw != NULL) {
+			ui_text_coloring_draw(text, temp, current->_x + x_offset, current->_y + current->font_offset_y + y_offset);
 		}
 		draw_set_color(current->text_coloring->default_color);
 		draw_string(temp, current->_x + x_offset, current->_y + current->font_offset_y + y_offset);
@@ -525,7 +750,7 @@ void ui_end_element() {
 	ui_end_element_of_size(UI_ELEMENT_H() + UI_ELEMENT_OFFSET());
 }
 
-void ui_resize(ui_handle_t *handle, int w, int h) {
+void ui_resize(ui_window_t *handle, int w, int h) {
 	handle->redraws = 2;
 	if (handle->texture.width != 0) {
 		gpu_texture_destroy(&handle->texture);
@@ -550,6 +775,9 @@ bool ui_input_changed() {
 }
 
 void ui_end_input() {
+	if (current->input_released) {
+		current->color_wheel_id = current->color_gradient_id = 0;
+	}
 	if (ui_on_tab_drop != NULL && current->drag_tab_handle != NULL) {
 		if (current->input_dx != 0 || current->input_dy != 0) {
 			iron_mouse_set_cursor(IRON_CURSOR_HAND);
@@ -561,6 +789,7 @@ void ui_end_input() {
 	}
 
 	current->is_key_pressed    = false;
+	current->key_char          = 0;
 	current->input_started     = false;
 	current->input_started_r   = false;
 	current->input_released    = false;
@@ -616,10 +845,9 @@ char *ui_extract_line_off(char *str, int line, int *off) {
 	str += *off;
 	static char temp[1024];
 	int         pos    = 0;
-	int         len    = strlen(str);
 	int         line_i = 0;
 	int         i      = 0;
-	for (i = 0; i < len; ++i) {
+	for (i = 0; str[i] != '\0'; ++i) {
 		if (str[i] == '\n') {
 			line_i++;
 			if (line_i > line) {
@@ -634,7 +862,9 @@ char *ui_extract_line_off(char *str, int line, int *off) {
 		if (line_i > line) {
 			break;
 		}
-		temp[pos++] = str[i];
+		if (pos < (int)sizeof(temp) - 1) {
+			temp[pos++] = str[i];
+		}
 	}
 	temp[pos] = 0;
 	*off += i;
@@ -713,7 +943,7 @@ void ui_draw_tooltip() {
 	if (current->slider_tooltip) {
 		draw_begin(NULL, false, 0);
 		draw_set_font(current->ops->font, current->font_size * 2);
-		sprintf(temp, "%f", round(current->scroll_handle->f * 100.0) / 100.0);
+		sprintf(temp, "%f", round(current->slider_value * 100.0) / 100.0);
 		string_strip_trailing_zeros(temp);
 		char *text  = temp;
 		float x_off = draw_string_width(current->ops->font, current->font_size * 2.0, text) / 2.0;
@@ -725,7 +955,7 @@ void ui_draw_tooltip() {
 		draw_string(text, x - x_off, current->slider_tooltip_y - y_off);
 		draw_end();
 	}
-	if (ui_touch_control && current->text_selected_handle != NULL) {
+	if (ui_touch_control && current->text_selected_id != 0) {
 		draw_begin(NULL, false, 0);
 		draw_set_font(current->ops->font, current->font_size * 2.0);
 		float x_off = draw_string_width(current->ops->font, current->font_size * 2.0, current->text_selected) / 2.0;
@@ -739,7 +969,7 @@ void ui_draw_tooltip() {
 		draw_end();
 	}
 
-	if (current->tooltip_text[0] != '\0' || current->tooltip_img != NULL) {
+	if (ui_tooltips && (current->tooltip_text[0] != '\0' || current->tooltip_img != NULL)) {
 		if (ui_input_changed()) {
 			current->tooltip_shown = false;
 			current->tooltip_wait  = current->input_dx == 0 && current->input_dy == 0; // Wait for movement before showing up again
@@ -763,7 +993,7 @@ void ui_draw_tooltip() {
 }
 
 void ui_draw_combo() {
-	if (current->combo_selected_handle == NULL) {
+	if (current->combo_selected_id == 0) {
 		return;
 	}
 	draw_set_color(theme->SEPARATOR_COL);
@@ -814,7 +1044,7 @@ void ui_draw_combo() {
 				}
 			}
 			current->combo_to_submit -= step;
-			current->submit_combo_handle = current->combo_selected_handle;
+			current->submit_combo_id = current->combo_selected_id;
 		}
 		else if ((arrow_down || wheel_down) && current->combo_to_submit < current->combo_selected_texts->length - 1) {
 			int step = 1;
@@ -824,7 +1054,7 @@ void ui_draw_combo() {
 				ui_lower_case(search, current->text_selected);
 				while (true) {
 					ui_lower_case(str, current->combo_selected_texts->buffer[current->combo_to_submit + step]);
-					if (strstr(str, search) == NULL && current->combo_to_submit + step > 0) {
+					if (strstr(str, search) == NULL && current->combo_to_submit + step < current->combo_selected_texts->length - 1) {
 						++step;
 					}
 					else {
@@ -839,7 +1069,7 @@ void ui_draw_combo() {
 			}
 
 			current->combo_to_submit += step;
-			current->submit_combo_handle = current->combo_selected_handle;
+			current->submit_combo_id = current->combo_selected_id;
 		}
 		if (current->combo_selected_window != NULL) {
 			current->combo_selected_window->redraws = 2;
@@ -860,21 +1090,22 @@ void ui_draw_combo() {
 		if (unroll_up) {
 			current->_y -= UI_ELEMENT_H() * 2.0;
 		}
-		if (ui_combo_first) {
-			ui_combo_search_handle->text = "";
+		if (current->combo_first) {
+			current->combo_search = "";
+			current->combo_first  = true;
 		}
 		ui_fill(0, 0, current->_w / UI_SCALE(), UI_ELEMENT_H() / UI_SCALE(), theme->SEPARATOR_COL);
-		strcpy(search, ui_text_input(ui_combo_search_handle, "", UI_ALIGN_LEFT, true, true));
+		strcpy(search, ui_text_input(&current->combo_search, "", UI_ALIGN_LEFT, true, true));
 		ui_lower_case(search, search);
 		if (current->is_released) {
-			ui_combo_first = true; // Keep combo open
+			current->combo_first = true; // Keep combo open
 		}
-		if (ui_combo_first) {
+		if (current->combo_first) {
 #if !defined(IRON_ANDROID) && !defined(IRON_IOS)
-			ui_start_text_edit(ui_combo_search_handle, UI_ALIGN_LEFT); // Focus search bar
+			ui_start_edit(ui_widget_id(&current->combo_search, UI_ID_TEXT), current->combo_search, UI_ALIGN_LEFT); // Focus search bar
 #endif
 		}
-		reset_position = ui_combo_search_handle->changed;
+		reset_position = ui_item_changed();
 	}
 
 	current->combo_selected_texts_filtered = 0;
@@ -887,30 +1118,31 @@ void ui_draw_combo() {
 		current->combo_selected_texts_filtered++;
 
 		if (reset_position) { // The search has changed, select first entry that matches
-			current->combo_to_submit = current->combo_selected_handle->i = i;
-			current->submit_combo_handle                                 = current->combo_selected_handle;
-			reset_position                                               = false;
+			current->combo_to_submit = i;
+			current->submit_combo_id = current->combo_selected_id;
+			reset_position           = false;
 		}
 		if (unroll_up) {
 			current->_y -= UI_ELEMENT_H() * 2.0;
 		}
-		theme->BUTTON_COL = i == current->combo_selected_handle->i ? theme->HIGHLIGHT_COL : theme->SEPARATOR_COL;
+		theme->BUTTON_COL = i == current->combo_to_submit ? theme->HIGHLIGHT_COL : theme->SEPARATOR_COL;
 		ui_fill(0, 0, current->_w / UI_SCALE(), UI_ELEMENT_H() / UI_SCALE(), theme->SEPARATOR_COL);
 		if (ui_button(current->combo_selected_texts->buffer[i], current->combo_selected_align, "")) {
-			current->combo_to_submit     = i;
-			current->submit_combo_handle = current->combo_selected_handle;
+			current->combo_to_submit = i;
+			current->submit_combo_id = current->combo_selected_id;
 			if (current->combo_selected_window != NULL) {
 				current->combo_selected_window->redraws = 2;
 			}
 			break;
 		}
-		if (current->combo_selected_images != NULL && current->combo_selected_images->length > i) {
+		if (current->combo_selected_images != NULL && current->combo_selected_images->length > i && current->combo_selected_images->buffer[i] != NULL) {
 			draw_scaled_image(current->combo_selected_images->buffer[i], current->_x - UI_ELEMENT_H(), current->_y - UI_ELEMENT_H() + 1, UI_ELEMENT_H(),
 			                  UI_ELEMENT_H());
 		}
 		if (current->_y + UI_ELEMENT_H() > iron_window_height() - current->window_border_bottom ||
 		    current->_y - UI_ELEMENT_H() * 2 < current->window_border_top) {
-			current->_x += current->combo_selected_w * unroll_right; // Next column
+			float column_w = current->combo_selected_w + (current->combo_selected_images != NULL ? UI_ELEMENT_H() : 0);
+			current->_x += column_w * unroll_right; // Next column
 			current->_y = current->combo_selected_y;
 		}
 	}
@@ -937,18 +1169,19 @@ void ui_draw_combo() {
 		}
 	}
 
-	if ((current->input_released || current->input_released_r || current->is_escape_down || current->is_return_down) && !ui_combo_first) {
+	if ((current->input_released || current->input_released_r || current->is_escape_down || current->is_return_down) && !current->combo_first) {
 		if (current->input_released_r || current->is_escape_down) {
-			current->submit_combo_handle = current->combo_selected_handle;
-			current->combo_to_submit     = current->combo_initial_value;
+			current->submit_combo_id = current->combo_selected_id;
+			current->combo_to_submit = current->combo_initial_value;
 		}
-		current->combo_selected_handle = NULL;
-		ui_combo_first                 = true;
+		current->combo_selected_id = 0;
+		current->is_hovered        = false;
+		current->combo_first       = true;
 	}
 	else {
-		ui_combo_first = false;
+		current->combo_first = false;
 	}
-	current->input_enabled = current->combo_selected_handle == NULL;
+	current->input_enabled = current->combo_selected_id == 0;
 	ui_end_region();
 	draw_end();
 }
@@ -963,56 +1196,37 @@ void ui_bake_elements() {
 	if (current->check_select_image.width != 0) {
 		gpu_texture_destroy(&current->check_select_image);
 	}
-	float r = UI_CHECK_SELECT_SIZE();
-	gpu_render_target_init(&current->check_select_image, r, r, GPU_TEXTURE_FORMAT_RGBA32);
-	draw_begin(&current->check_select_image, true, 0x00000000);
-	draw_set_color(0xffffffff);
-	draw_line(0, r / 2.0, r / 2.0 - 2.0 * UI_SCALE(), r - 2.0 * UI_SCALE(), 2.0 * UI_SCALE());
-	draw_line(r / 2.0 - 3.0 * UI_SCALE(), r - 3.0 * UI_SCALE(), r / 2.0 + 5.0 * UI_SCALE(), r - 11.0 * UI_SCALE(), 2.0 * UI_SCALE());
-	draw_end();
+	float sc = UI_SCALE();
+	int   r  = (int)UI_CHECK_SELECT_SIZE();
+	ui_bake_check(&current->check_select_image, r, 0.7 * sc, r / 2.0 + 0.7 * sc, r / 2.0 - 2.3 * sc, r - 2.3 * sc, r / 2.0 + 5.0 * sc, r - 9.6 * sc, sc);
 
 	if (current->radio_image.width != 0) {
 		gpu_texture_destroy(&current->radio_image);
 	}
-	r = UI_CHECK_SIZE();
-	gpu_render_target_init(&current->radio_image, r, r, GPU_TEXTURE_FORMAT_RGBA32);
-	draw_begin(&current->radio_image, true, 0x00000000);
-	draw_set_color(0xffaaaaaa);
-	draw_filled_circle(r / 2.0, r / 2.0, r / 2.0, 0);
-	draw_set_color(0xffffffff);
-	draw_circle(r / 2.0, r / 2.0, r / 2.0, 0, 1.0 * UI_SCALE());
-	draw_end();
+	r = (int)UI_CHECK_SIZE();
+	ui_bake_circle(&current->radio_image, r, r / 2.0, r / 2.0 - sc);
 
 	if (current->radio_select_image.width != 0) {
 		gpu_texture_destroy(&current->radio_select_image);
 	}
-	r = UI_CHECK_SELECT_SIZE();
-	gpu_render_target_init(&current->radio_select_image, r, r, GPU_TEXTURE_FORMAT_RGBA32);
-	draw_begin(&current->radio_select_image, true, 0x00000000);
-	draw_set_color(0xffaaaaaa);
-	draw_filled_circle(r / 2.0, r / 2.0, 4.5 * UI_SCALE(), 0);
-	draw_set_color(0xffffffff);
-	draw_filled_circle(r / 2.0, r / 2.0, 4.0 * UI_SCALE(), 0);
-	draw_end();
+	r = (int)UI_CHECK_SELECT_SIZE();
+	ui_bake_circle(&current->radio_select_image, r, 4.5 * sc, 4.0 * sc);
 
 	if (current->filled_round_corner_image.width != 0) {
 		gpu_texture_destroy(&current->filled_round_corner_image);
 	}
-	r = 4.0 * UI_SCALE();
-	gpu_render_target_init(&current->filled_round_corner_image, r, r, GPU_TEXTURE_FORMAT_RGBA32);
-	draw_begin(&current->filled_round_corner_image, true, 0x00000000);
-	draw_set_color(0xffffffff);
-	draw_filled_circle(r, r, r, 0);
-	draw_end();
+	r = (int)(4.0 * sc);
+	ui_bake_round_corner(&current->filled_round_corner_image, r, r, -1.0);
 
 	if (current->round_corner_image.width != 0) {
 		gpu_texture_destroy(&current->round_corner_image);
 	}
-	gpu_render_target_init(&current->round_corner_image, r, r, GPU_TEXTURE_FORMAT_RGBA32);
-	draw_begin(&current->round_corner_image, true, 0x00000000);
-	draw_set_color(0xffffffff);
-	draw_circle(r, r, r, 0, 1);
-	draw_end();
+	ui_bake_round_corner(&current->round_corner_image, r, r, r - 1.0);
+
+	if (current->shadow_image.width != 0) {
+		gpu_texture_destroy(&current->shadow_image);
+	}
+	ui_bake_shadow(&current->shadow_image, (int)(16.0 * UI_SCALE()) + r, r);
 
 	current->elements_baked = true;
 }
@@ -1038,7 +1252,7 @@ void ui_begin_region(ui_t *ui, int x, int y, int w) {
 }
 
 void ui_end_region() {
-	current->tab_pressed_handle = NULL;
+	current->tab_pressed_id = 0;
 }
 
 void ui_set_cursor_to_input(int align) {
@@ -1052,13 +1266,16 @@ void ui_set_cursor_to_input(int align) {
 	current->highlight_anchor = current->cursor_x;
 }
 
-void ui_start_text_edit(ui_handle_t *handle, int align) {
-	current->is_typing          = true;
-	current->submit_text_handle = current->text_selected_handle;
-	strcpy(current->text_to_submit, current->text_selected);
-	current->text_selected_handle = handle;
-	strcpy(current->text_selected, handle->text);
-	current->cursor_x = strlen(handle->text);
+static void ui_start_edit(ui_id_t id, const char *text, int align) {
+	current->is_typing = true;
+	if (current->text_selected_id != 0 && current->text_selected_id != id) {
+		current->submit_text_id = current->text_selected_id;
+		strcpy(current->text_to_submit, current->text_selected);
+	}
+	current->text_selected_id = id;
+	snprintf(current->text_selected, UI_TEXT_MAX, "%s", text);
+	snprintf(current->text_original, UI_TEXT_MAX, "%s", text);
+	current->cursor_x = strlen(current->text_selected);
 	if (current->tab_pressed) {
 		current->tab_pressed    = false;
 		current->is_key_pressed = false; // Prevent text deselect after tab press
@@ -1066,30 +1283,33 @@ void ui_start_text_edit(ui_handle_t *handle, int align) {
 	else if (!current->highlight_on_select) { // Set cursor to click location
 		ui_set_cursor_to_input(align);
 	}
-	current->tab_pressed_handle = handle;
-	current->highlight_anchor   = current->highlight_on_select ? 0 : current->cursor_x;
+	current->tab_pressed_id   = id;
+	current->highlight_anchor = current->highlight_on_select ? 0 : current->cursor_x;
 	iron_keyboard_show();
 }
 
-void ui_submit_text_edit() {
-	current->changed                     = strcmp(current->submit_text_handle->text, current->text_to_submit) != 0;
-	current->submit_text_handle->changed = current->changed;
-	current->submit_text_handle->text    = string_copy(current->text_to_submit);
-	current->submit_text_handle          = NULL;
-	current->text_to_submit[0]           = '\0';
-	current->text_selected[0]            = '\0';
+void ui_start_text_edit(char **value, int align) {
+	ui_start_edit(ui_widget_id(value, UI_ID_TEXT), *value, align);
+}
+
+static void ui_finish_text_edit(void) {
+	current->submit_text_id    = 0;
+	current->text_to_submit[0] = '\0';
+	// Another field may already own the editor when a pending value is committed
+	if (current->text_selected_id == 0)
+		current->text_selected[0] = '\0';
 }
 
 void keyboard_up_listener(int key_code);
 
 void ui_deselect_text(ui_t *ui) {
-	if (ui->text_selected_handle == NULL) {
+	if (ui->text_selected_id == 0) {
 		return;
 	}
-	ui->submit_text_handle = ui->text_selected_handle;
+	ui->submit_text_id = ui->text_selected_id;
 	strcpy(ui->text_to_submit, ui->text_selected);
-	ui->text_selected_handle = NULL;
-	ui->is_typing            = false;
+	ui->text_selected_id = 0;
+	ui->is_typing        = false;
 	if (ui->current_window != NULL) {
 		ui->current_window->redraws = 2;
 	}
@@ -1128,6 +1348,20 @@ void ui_insert_chars_at(char *str, int at, char *cs) {
 	}
 }
 
+int ui_insert_chars_at_capped(char *str, int at, char *cs, int cap) {
+	int len   = strlen(str);
+	int count = strlen(cs);
+	if (len + count > cap - 1) {
+		count = cap - 1 - len;
+	}
+	if (count <= 0) {
+		return 0;
+	}
+	memmove(str + at + count, str + at, len - at + 1);
+	memcpy(str + at, cs, count);
+	return count;
+}
+
 // Number of leading spaces to step over when moving/removing a tab backwards
 static int ui_tab_dedent_count(char *str, int cursor_x) {
 	int n = cursor_x % 4;
@@ -1159,8 +1393,14 @@ static int ui_tab_indent_count(char *str, int cursor_x, int len) {
 	return n;
 }
 
-void ui_update_text_edit(int align, bool editable, bool live_update) {
-	char text[1024];
+#ifdef IRON_MACOS
+#define UI_ALT_TYPES true // Option+key types characters
+#else
+#define UI_ALT_TYPES false
+#endif
+
+static void ui_update_text_edit(int align, bool editable) {
+	char text[UI_TEXT_MAX];
 	strcpy(text, current->text_selected);
 	if (current->is_key_pressed) {                // Process input
 		if (current->key_code == KEY_CODE_LEFT) { // Move cursor
@@ -1275,7 +1515,7 @@ void ui_update_text_edit(int align, bool editable, bool live_update) {
 			ui_deselect_text(current);
 		}
 		else if (current->key_code == KEY_CODE_ESCAPE) { // Cancel
-			strcpy(current->text_selected, current->text_selected_handle->text);
+			strcpy(current->text_selected, current->text_original);
 			ui_deselect_text(current);
 		}
 		else if (current->key_code == KEY_CODE_TAB && current->tab_switch_enabled && !current->is_ctrl_down) { // Next field
@@ -1287,7 +1527,7 @@ void ui_update_text_edit(int align, bool editable, bool live_update) {
 			current->cursor_x = 0;
 		}
 		else if (current->key_code == KEY_CODE_END) {
-			current->cursor_x = strlen(text);
+			current->cursor_x = strlen(current->text_selected);
 		}
 		else if (current->is_ctrl_down && current->is_a_down) { // Select all
 			current->cursor_x         = strlen(text);
@@ -1297,7 +1537,8 @@ void ui_update_text_edit(int align, bool editable, bool live_update) {
 		         current->key_code != KEY_CODE_SHIFT && current->key_code != KEY_CODE_CAPS_LOCK && current->key_code != KEY_CODE_CONTROL &&
 		         current->key_code != KEY_CODE_META && current->key_code != KEY_CODE_ALT && current->key_code != KEY_CODE_UP &&
 		         current->key_code != KEY_CODE_DOWN && current->key_char >= 32 && (!current->is_ctrl_down || current->is_alt_down) && // AltGr = ctrl+alt
-		         !(current->key_code >= KEY_CODE_F1 && current->key_code <= KEY_CODE_F24)) {
+		         !(current->key_code >= KEY_CODE_F1 && current->key_code <= KEY_CODE_F24) &&
+		         (!current->is_alt_down || current->is_ctrl_down || UI_ALT_TYPES)) { // Alt shortcuts are not typed
 			ui_remove_chars_at(text, current->highlight_anchor, current->cursor_x - current->highlight_anchor);
 			ui_insert_char_at(text, current->highlight_anchor, current->key_char);
 
@@ -1306,7 +1547,7 @@ void ui_update_text_edit(int align, bool editable, bool live_update) {
 		bool selecting =
 		    current->is_shift_down && (current->key_code == KEY_CODE_LEFT || current->key_code == KEY_CODE_RIGHT || current->key_code == KEY_CODE_SHIFT ||
 		                               current->key_code == KEY_CODE_HOME || current->key_code == KEY_CODE_END);
-		// isCtrlDown && isAltDown is the condition for AltGr was pressed
+		// is_ctrl_down && is_alt_down is the condition for AltGr was pressed
 		// AltGr is part of the German keyboard layout and part of key combinations like AltGr + e -> €
 		bool ctrl_nav = current->is_ctrl_down && !current->is_shift_down &&
 		                (current->key_code == KEY_CODE_LEFT || current->key_code == KEY_CODE_RIGHT || current->key_code == KEY_CODE_HOME ||
@@ -1318,8 +1559,8 @@ void ui_update_text_edit(int align, bool editable, bool live_update) {
 
 	if (editable && ui_is_paste) { // Process cut copy paste
 		ui_remove_chars_at(text, current->highlight_anchor, current->cursor_x - current->highlight_anchor);
-		ui_insert_chars_at(text, current->highlight_anchor, ui_text_to_paste);
-		current->cursor_x += strlen(ui_text_to_paste);
+		current->cursor_x = current->highlight_anchor;
+		current->cursor_x += ui_insert_chars_at_capped(text, current->highlight_anchor, ui_text_to_paste, UI_TEXT_MAX);
 		current->highlight_anchor = current->cursor_x;
 		ui_text_to_paste[0]       = 0;
 		ui_is_paste               = false;
@@ -1327,23 +1568,25 @@ void ui_update_text_edit(int align, bool editable, bool live_update) {
 
 	if (ui_is_copy) {
 		if (current->highlight_anchor == current->cursor_x) {
-			strncpy(ui_text_to_copy, text, 8191); // Copy
-			ui_text_to_copy[8191] = '\0';
+			strncpy(ui_text_to_copy, text, UI_TEXT_MAX - 1); // Copy
+			ui_text_to_copy[UI_TEXT_MAX - 1] = '\0';
 		}
 		else if (current->highlight_anchor < current->cursor_x) {
 			int len = current->cursor_x - current->highlight_anchor;
-			if (len > 8191)
-				len = 8191;
+			if (len > UI_TEXT_MAX - 1)
+				len = UI_TEXT_MAX - 1;
 			strncpy(ui_text_to_copy, text + current->highlight_anchor, len);
 			ui_text_to_copy[len] = '\0';
 		}
 		else {
 			int len = current->highlight_anchor - current->cursor_x;
-			if (len > 8191)
-				len = 8191;
+			if (len > UI_TEXT_MAX - 1)
+				len = UI_TEXT_MAX - 1;
 			strncpy(ui_text_to_copy, text + current->cursor_x, len);
 			ui_text_to_copy[len] = '\0';
 		}
+		iron_copy_to_clipboard(ui_text_to_copy);
+		ui_is_copy = false;
 	}
 
 	if (editable && ui_is_cut) { // Cut
@@ -1393,10 +1636,6 @@ void ui_update_text_edit(int align, bool editable, bool live_update) {
 	current->cursor_screen_y = current->_y;
 
 	strcpy(current->text_selected, text);
-	if (live_update && current->text_selected_handle != NULL) {
-		current->text_selected_handle->changed = strcmp(current->text_selected_handle->text, current->text_selected) != 0;
-		current->text_selected_handle->text    = string_copy(current->text_selected);
-	}
 }
 
 void ui_set_hovered_tab_name(char *name) {
@@ -1409,34 +1648,43 @@ void ui_set_hovered_tab_name(char *name) {
 	}
 }
 
+static void ui_select_tab(int position) {
+	int previous = *current->tab_handle;
+	if (previous >= 0 && previous < 16) {
+		current->tab_state->scroll[previous] = current->current_window->scroll_offset;
+	}
+	current->tab_scroll              = current->tab_state->scroll[position];
+	current->tab_scroll_pending      = true;
+	*current->tab_handle             = position;
+	current->current_window->redraws = 3;
+	current->tab_state->changed      = true;
+	current->changed                 = true;
+}
+
 void ui_draw_tabs() {
 	current->input_x = current->restore_x;
 	current->input_y = current->restore_y;
 	if (current->current_window == NULL) {
 		return;
 	}
-	float tab_x                  = 0.0;
-	float tab_y                  = 0.0;
-	float tab_h_min              = UI_BUTTON_H() * 1.1;
-	float header_h               = current->current_window->drag_enabled ? UI_HEADER_DRAG_H() : 0;
-	float tab_h                  = (theme->FULL_TABS && current->tab_vertical)
-	                                   ? ((current->_window_h - header_h - 20 - current->tab_count * 6 * UI_SCALE()) / current->tab_count)
-	                                   : tab_h_min;
-	float orig_y                 = current->_y;
-	current->_y                  = header_h;
-	current->tab_handle->changed = false;
+	float tab_x                 = current->tab_offset_x;
+	current->tab_offset_x       = 0.0;
+	float tab_y                 = 0.0;
+	float tab_h_min             = UI_BUTTON_H() * 1.1;
+	float header_h              = current->current_window->drag_enabled ? UI_HEADER_DRAG_H() : 0;
+	float tab_h                 = (theme->FULL_TABS && current->tab_vertical)
+	                                  ? ((current->_window_h - header_h - 20 - current->tab_count * 6 * UI_SCALE()) / current->tab_count)
+	                                  : tab_h_min;
+	float orig_y                = current->_y;
+	current->_y                 = header_h;
+	current->tab_state->changed = false;
 
-	if (current->is_ctrl_down && current->is_tab_down) { // Next tab
-		current->tab_handle->i++;
-		if (current->tab_handle->i >= current->tab_count) {
-			current->tab_handle->i = 0;
-		}
-		current->tab_handle->changed = true;
-		current->is_tab_down         = false;
+	if (*current->tab_handle >= current->tab_count) { // Negative means no tab is selected
+		*current->tab_handle = current->tab_count - 1;
 	}
-
-	if (current->tab_handle->i >= current->tab_count) {
-		current->tab_handle->i = current->tab_count - 1;
+	if (current->is_ctrl_down && current->is_tab_down) {
+		ui_select_tab((*current->tab_handle + 1) % current->tab_count);
+		current->is_tab_down = false;
 	}
 
 	draw_set_color(theme->SEPARATOR_COL); // Tab background
@@ -1455,6 +1703,16 @@ void ui_draw_tabs() {
 	float base_y   = current->tab_vertical ? current->_y + 10 : current->_y + 2;
 	bool  _enabled = current->enabled;
 
+	// Faded and disabled tabs are buttons, tabs can not be dropped in between them
+	int   dock_count = 0;
+	float dock_end_x = 0.0;
+	float drop_x     = -1.0;
+	bool  docked     = ui_on_tab_dock == NULL || ui_on_tab_dock(current->tab_handle);
+	bool  dock       = ui_on_tab_drop != NULL && docked;
+	bool  dragging   = dock && current->drag_tab_handle != NULL && !current->tab_vertical;
+	bool  dropped    = false;
+	bool  hover_dock = false;
+
 	for (int i = 0; i < current->tab_count; ++i) {
 		current->enabled = current->tab_enabled[i];
 		current->_x      = current->tab_vertical ? tab_x + UI_ELEMENT_W() * 0.1 : tab_x;
@@ -1471,26 +1729,38 @@ void ui_draw_tabs() {
 		bool started  = ui_get_started(tab_h);
 		bool pushed   = ui_get_pushed(tab_h);
 		bool hover    = ui_get_hover(tab_h);
-		if (ui_on_tab_drop != NULL) {
+		bool dockable = current->tab_colors[i] != -2 && current->tab_enabled[i];
+		if (dockable) {
+			dock_count = i + 1;
+			dock_end_x = current->_x + current->_w + 1;
+		}
+		if (dock && dockable) {
 			if (started) {
 				current->drag_tab_handle   = current->tab_handle;
 				current->drag_tab_position = i;
 			}
-			if (current->drag_tab_handle != NULL && hover && current->input_released) {
-				ui_on_tab_drop(current->tab_handle, i, current->drag_tab_handle, current->drag_tab_position);
-				current->tab_handle->i = i;
+			if (current->drag_tab_handle != NULL && hover) {
+				hover_dock = true;
+				bool same  = current->drag_tab_handle == current->tab_handle;
+				if (!same || current->drag_tab_position != i) {
+					// Tab lands after the hovered one when moving to the right
+					bool after = same && current->drag_tab_position < i;
+					drop_x     = after ? current->_x + current->_w : current->_x;
+				}
+				if (current->input_released) {
+					ui_on_tab_drop(current->tab_handle, i, current->drag_tab_handle, current->drag_tab_position);
+					ui_select_tab(i);
+					dropped = true;
+				}
 			}
 		}
-		if (released) {
-			ui_handle_t *h                   = ui_nest(current->tab_handle, current->tab_handle->i); // Restore tab scroll
-			h->scroll_offset                 = current->current_window->scroll_offset;
-			h                                = ui_nest(current->tab_handle, i);
-			current->tab_scroll              = h->scroll_offset;
-			current->tab_handle->i           = i; // Set new tab
-			current->current_window->redraws = 3;
-			current->tab_handle->changed     = true;
+		if (ui_on_tab_context_menu != NULL && docked && dockable && hover && current->input_released_r) {
+			ui_on_tab_context_menu(current->tab_handle, i);
 		}
-		bool selected = current->tab_handle->i == i;
+		if (released) {
+			ui_select_tab(i);
+		}
+		bool selected = (*current->tab_handle) == i;
 
 		draw_set_color((pushed || hover)                                                ? theme->HOVER_COL
 		               : (current->tab_colors[i] != -1 && current->tab_colors[i] != -2) ? current->tab_colors[i]
@@ -1547,8 +1817,28 @@ void ui_draw_tabs() {
 		}
 	}
 
+	// Dock at the end when dropping the tab next to the tab names
+	if (dragging && !dropped && !hover_dock &&
+	    ui_input_in_rect(current->_window_x, current->_window_y + header_h, current->_window_w, current->button_offset_y + tab_h + 2)) {
+		bool same = current->drag_tab_handle == current->tab_handle;
+		int  to   = same ? dock_count - 1 : dock_count;
+		if (!same || current->drag_tab_position != to) {
+			drop_x = dock_end_x;
+			if (current->input_released) {
+				ui_on_tab_drop(current->tab_handle, to, current->drag_tab_handle, current->drag_tab_position);
+				ui_select_tab(to);
+			}
+		}
+	}
+	if (dragging && drop_x >= 0 && !current->input_released) {
+		// Drop marker
+		draw_set_color(theme->HIGHLIGHT_COL);
+		draw_filled_rect(current->button_offset_y + drop_x - 1, base_y + current->button_offset_y, 2 * UI_SCALE(), tab_h);
+		current->current_window->redraws = 2; // Clear the marker once the mouse leaves
+	}
+
 	current->enabled = _enabled;
-	ui_set_hovered_tab_name(current->tab_names[current->tab_handle->i]);
+	ui_set_hovered_tab_name(*current->tab_handle >= 0 ? current->tab_names[(*current->tab_handle)] : "");
 
 	current->_x = 0; // Restore positions
 	current->_y = orig_y;
@@ -1567,7 +1857,7 @@ void ui_draw_arrow(bool selected, bool align_right) {
 			draw_filled_triangle(x + UI_ARROW_SIZE(), y - 1, x + UI_ARROW_SIZE(), y + UI_ARROW_SIZE() + 1, x, y + UI_ARROW_SIZE() / 2.0);
 		}
 		else {
-			draw_filled_triangle(x + UI_ARROW_SIZE(), y - 0.1, x, y + UI_ARROW_SIZE() + 0.1, x + UI_ARROW_SIZE(), y + UI_ARROW_SIZE() / 2.0);
+			draw_filled_triangle(x, y - 0.1, x, y + UI_ARROW_SIZE() + 0.1, x + UI_ARROW_SIZE(), y + UI_ARROW_SIZE() / 2.0);
 		}
 	}
 }
@@ -1681,10 +1971,8 @@ void ui_init(ui_t *ui, ui_options_t *ops) {
 	current->restore_y           = -1;
 	current->input_x             = -1;
 	current->input_y             = -1;
-	if (ui_combo_search_handle == NULL) {
-		ui_combo_search_handle = ui_handle_create();
-		gc_root(ui_combo_search_handle);
-	}
+	current->combo_search        = "";
+	current->combo_first         = true;
 	if (_ui_row2 == NULL) {
 		_ui_row2 = f32_array_create_from_raw((float[]){1.0 / 2.0, 1.0 / 2.0}, 2);
 		_ui_row3 = f32_array_create_from_raw((float[]){1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0}, 3);
@@ -1692,12 +1980,6 @@ void ui_init(ui_t *ui, ui_options_t *ops) {
 		_ui_row5 = f32_array_create_from_raw((float[]){1.0 / 5.0, 1.0 / 5.0, 1.0 / 5.0, 1.0 / 5.0, 1.0 / 5.0}, 5);
 		_ui_row6 = f32_array_create_from_raw((float[]){1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0}, 6);
 		_ui_row7 = f32_array_create_from_raw((float[]){1.0 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 1.0 / 7.0}, 7);
-		gc_root(_ui_row2);
-		gc_root(_ui_row3);
-		gc_root(_ui_row4);
-		gc_root(_ui_row5);
-		gc_root(_ui_row6);
-		gc_root(_ui_row7);
 	}
 }
 
@@ -1735,7 +2017,7 @@ void ui_end_sticky() {
 }
 
 void ui_end_window() {
-	ui_handle_t *handle = current->current_window;
+	ui_window_t *handle = current->current_window;
 	if (handle == NULL)
 		return;
 	if (handle->redraws > 0 || current->is_scrolling) {
@@ -1754,6 +2036,7 @@ void ui_end_window() {
 
 			if (handle->text != NULL) { // Window title
 				draw_set_color(theme->TEXT_COL);
+				draw_set_font(current->ops->font, current->font_size);
 				draw_string(handle->text, current->_window_w / 2 - draw_string_width(current->ops->font, current->font_size, handle->text) / 2,
 				            10 * UI_SCALE());
 			}
@@ -1764,7 +2047,7 @@ void ui_end_window() {
 		float full_size   = handle->layout == UI_LAYOUT_VERTICAL ? current->_y - current->window_header_h : current->_x - current->window_header_w;
 		full_size -= handle->scroll_offset;
 
-		if (full_size < window_size || !current->scroll_enabled) { // Disable scrollbar
+		if (full_size <= window_size || !current->scroll_enabled) { // Disable scrollbar
 			handle->scroll_enabled = false;
 			handle->scroll_offset  = 0;
 		}
@@ -1772,10 +2055,7 @@ void ui_end_window() {
 			if (handle->layout == UI_LAYOUT_VERTICAL) {
 				handle->scroll_enabled = true;
 			}
-			if (current->tab_scroll < 0) { // Restore tab
-				handle->scroll_offset = current->tab_scroll;
-				current->tab_scroll   = 0;
-			}
+
 			float wy               = current->_window_y + current->window_header_h;
 			float amount_to_scroll = full_size - window_size;
 			float amount_scrolled  = -handle->scroll_offset;
@@ -1802,7 +2082,7 @@ void ui_end_window() {
 			if (handle == current->scroll_handle) { // Scroll
 				ui_scroll(current->input_dy * e);
 			}
-			else if (scroll_delta != 0 && current->combo_selected_handle == NULL &&
+			else if (scroll_delta != 0 && current->combo_selected_id == 0 &&
 			         ui_input_in_rect(current->_window_x, wy, current->_window_w, window_size)) { // Wheel
 				ui_scroll(scroll_delta * UI_ELEMENT_H());
 			}
@@ -1835,6 +2115,10 @@ void ui_end_window() {
 		draw_end();
 	}
 
+	if (current->tab_scroll_pending) {
+		handle->scroll_offset       = current->tab_scroll;
+		current->tab_scroll_pending = false;
+	}
 	current->window_ended = true;
 
 	// Draw window texture
@@ -1847,14 +2131,14 @@ void ui_end_window() {
 	draw_end();
 }
 
-bool ui_window_dirty(ui_handle_t *handle, int x, int y, int w, int h) {
+bool ui_window_dirty(ui_window_t *handle, int x, int y, int w, int h) {
 	float wx            = x + handle->drag_x;
 	float wy            = y + handle->drag_y;
 	float input_changed = ui_input_in_rect(wx, wy, w, h) && ui_input_changed();
 	return current->always_redraw || current->is_scrolling || input_changed;
 }
 
-bool ui_window(ui_handle_t *handle, int x, int y, int w, int h, bool drag) {
+bool ui_window(ui_window_t *handle, int x, int y, int w, int h, bool drag) {
 	if (handle->texture.width == 0 || w != handle->texture.width || h != handle->texture.height) {
 		ui_resize(handle, w, h);
 	}
@@ -1942,15 +2226,17 @@ bool ui_window(ui_handle_t *handle, int x, int y, int w, int h, bool drag) {
 }
 
 bool ui_button(char *text, int align, char *label) {
+	current->item_changed = false;
 	if (!ui_is_visible(UI_ELEMENT_H())) {
 		ui_end_element();
+		ui_record_change();
 		return false;
 	}
 	bool released = ui_get_released(UI_ELEMENT_H());
 	bool pushed   = ui_get_pushed(UI_ELEMENT_H());
 	bool hover    = ui_get_hover(UI_ELEMENT_H());
 	if (released) {
-		current->changed = true;
+		current->item_changed = current->changed = true;
 	}
 
 	if (theme->FILL_BUTTON_BG || pushed || hover) {
@@ -1967,6 +2253,7 @@ bool ui_button(char *text, int align, char *label) {
 	}
 
 	ui_end_element();
+	ui_record_change();
 	return released;
 }
 
@@ -1978,13 +2265,16 @@ void ui_split_text(char *lines, int align, int bg) {
 }
 
 int ui_text(char *text, int align, int bg) {
+	current->item_changed = false;
 	if (ui_line_count(text) > 1) {
 		ui_split_text(text, align, bg);
+		ui_record_change();
 		return UI_STATE_IDLE;
 	}
 	float h = fmax(UI_ELEMENT_H(), draw_font_height(current->ops->font, current->font_size));
 	if (!ui_is_visible(h)) {
 		ui_end_element_of_size(h + UI_ELEMENT_OFFSET());
+		ui_record_change();
 		return UI_STATE_IDLE;
 	}
 	bool started  = ui_get_started(h);
@@ -2000,12 +2290,31 @@ int ui_text(char *text, int align, int bg) {
 	ui_draw_string(text, theme->TEXT_OFFSET, 0, align, true);
 
 	ui_end_element_of_size(h + UI_ELEMENT_OFFSET());
+	ui_record_change();
 	return started ? UI_STATE_STARTED : released ? UI_STATE_RELEASED : down ? UI_STATE_DOWN : UI_STATE_IDLE;
 }
 
-bool ui_tab(ui_handle_t *handle, char *text, bool vertical, uint32_t color, bool align_right) {
+int ui_swatch(uint32_t color) {
+	draw_set_color(color);
+	ui_draw_rect(true, false, current->_x + current->button_offset_y, current->_y + current->button_offset_y, current->_w - current->button_offset_y * 2,
+	             UI_BUTTON_H());
+	return ui_text("", 0, 0x00000000);
+}
+
+bool ui_tab(int *value, char *text, bool vertical, uint32_t color, bool align_right) {
+	current->item_changed = false;
 	if (current->tab_count == 0) { // First tab
-		current->tab_handle      = handle;
+		ui_id_t          id    = ui_widget_id(value, UI_ID_TAB);
+		ui_tab_state_t **state = &current->current_window->tabs;
+		while (*state != NULL && (*state)->id != id)
+			state = &(*state)->next;
+		if (*state == NULL) {
+			*state       = calloc(1, sizeof(**state));
+			(*state)->id = id;
+		}
+		(*state)->value          = value;
+		current->tab_state       = *state;
+		current->tab_handle      = value;
 		current->tab_vertical    = vertical;
 		current->tab_align_right = align_right;
 		if (vertical) {
@@ -2033,17 +2342,28 @@ bool ui_tab(ui_handle_t *handle, char *text, bool vertical, uint32_t color, bool
 	current->tab_colors[current->tab_count]  = color;
 	current->tab_enabled[current->tab_count] = current->enabled;
 	current->tab_count++;
-	return handle->i == current->tab_count - 1;
+	current->next_id = 0;
+	return (*value) == current->tab_count - 1;
 }
 
-bool ui_panel(ui_handle_t *handle, char *text, bool is_tree, bool filled, bool align_right) {
+bool ui_tab_changed(ui_window_t *window, int *value) {
+	for (ui_tab_state_t *state = window->tabs; state != NULL; state = state->next) {
+		if (state->value == value)
+			return state->changed;
+	}
+	return false;
+}
+
+bool ui_panel(bool *value, char *text, bool is_tree, bool filled, bool align_right) {
+	current->item_changed = false;
 	if (!ui_is_visible(UI_ELEMENT_H())) {
 		ui_end_element();
-		return handle->b;
+		ui_record_change();
+		return (*value);
 	}
 	if (ui_get_released(UI_ELEMENT_H())) {
-		handle->b       = !handle->b;
-		handle->changed = current->changed = true;
+		(*value)              = !(*value);
+		current->item_changed = current->changed = true;
 	}
 
 	if (filled) {
@@ -2053,26 +2373,28 @@ bool ui_panel(ui_handle_t *handle, char *text, bool is_tree, bool filled, bool a
 	}
 
 	if (is_tree) {
-		ui_draw_tree(handle->b);
+		ui_draw_tree((*value));
 	}
 	else {
-		ui_draw_arrow(handle->b, align_right);
+		ui_draw_arrow((*value), align_right);
 	}
 
 	draw_set_color(theme->LABEL_COL); // Title
 	ui_draw_string(text, current->title_offset_x, 0, UI_ALIGN_LEFT, true);
 
 	ui_end_element();
-	return handle->b;
+	ui_record_change();
+	return (*value);
 }
 
 int ui_sub_image(gpu_texture_t *image, uint32_t tint, int h, int sx, int sy, int sw, int sh) {
-	float iw     = (sw > 0 ? sw : image->width) * UI_SCALE();
-	float ih     = (sh > 0 ? sh : image->height) * UI_SCALE();
-	float w      = fmin(iw, current->_w);
-	float x      = current->_x;
-	float scroll = current->current_window != NULL ? current->current_window->scroll_enabled : false;
-	float r      = current->current_ratio == -1 ? 1.0 : ui_get_ratio(current->ratios, current->current_ratio, 1);
+	current->item_changed = false;
+	float iw              = (sw > 0 ? sw : image->width) * UI_SCALE();
+	float ih              = (sh > 0 ? sh : image->height) * UI_SCALE();
+	float w               = fmin(iw, current->_w);
+	float x               = current->_x;
+	float scroll          = current->current_window != NULL ? current->current_window->scroll_enabled : false;
+	float r               = current->current_ratio == -1 ? 1.0 : ui_get_ratio(current->ratios, current->current_ratio, 1);
 	if (current->image_scroll_align) { // Account for scrollbar size
 		w = fmin(iw, current->_w - current->button_offset_y * 2.0);
 		x += current->button_offset_y;
@@ -2096,6 +2418,7 @@ int ui_sub_image(gpu_texture_t *image, uint32_t tint, int h, int sx, int sy, int
 
 	if (!ui_is_visible(h)) {
 		ui_end_element_of_size(h);
+		ui_record_change();
 		return UI_STATE_IDLE;
 	}
 	bool started  = ui_get_started(h);
@@ -2115,6 +2438,7 @@ int ui_sub_image(gpu_texture_t *image, uint32_t tint, int h, int sx, int sy, int
 	}
 
 	ui_end_element_of_size(h);
+	ui_record_change();
 	return started ? UI_STATE_STARTED : released ? UI_STATE_RELEASED : down ? UI_STATE_DOWN : hover ? UI_STATE_HOVERED : UI_STATE_IDLE;
 }
 
@@ -2122,10 +2446,13 @@ int ui_image(gpu_texture_t *image, uint32_t tint, int h) {
 	return ui_sub_image(image, tint, h, 0, 0, image->width, image->height);
 }
 
-char *ui_text_input(ui_handle_t *handle, char *label, int align, bool editable, bool live_update) {
+char *ui_text_input(char **value, char *label, int align, bool editable, bool live_update) {
+	current->item_changed = false;
+	ui_id_t id            = ui_widget_id(value, UI_ID_TEXT);
 	if (!ui_is_visible(UI_ELEMENT_H())) {
 		ui_end_element();
-		return handle->text;
+		ui_record_change();
+		return (*value);
 	}
 
 	bool hover = ui_get_hover(UI_ELEMENT_H());
@@ -2137,26 +2464,35 @@ char *ui_text_input(ui_handle_t *handle, char *label, int align, bool editable, 
 	             UI_BUTTON_H());
 
 	bool released = ui_get_released(UI_ELEMENT_H());
-	if (current->submit_text_handle == handle && released) { // Keep editing selected text
-		current->is_typing            = true;
-		current->text_selected_handle = current->submit_text_handle;
-		current->submit_text_handle   = NULL;
+	if (current->submit_text_id == id && released) { // Keep editing selected text
+		current->is_typing        = true;
+		current->text_selected_id = current->submit_text_id;
+		current->submit_text_id   = 0;
 		ui_set_cursor_to_input(align);
 	}
-	bool start_edit = released || current->tab_pressed;
-	handle->changed = false;
+	bool start_edit       = released || current->tab_pressed;
+	current->item_changed = false;
 
-	if (current->text_selected_handle != handle && start_edit) {
-		ui_start_text_edit(handle, align);
+	if (current->text_selected_id != id && start_edit) {
+		ui_start_edit(id, *value, align);
 	}
-	if (current->text_selected_handle == handle) {
-		ui_update_text_edit(align, editable, live_update);
+	if (current->text_selected_id == id) {
+		ui_update_text_edit(align, editable);
+		if (live_update && current->text_selected_id == id && strcmp(*value, current->text_selected) != 0) {
+			*value                = string_copy(current->text_selected);
+			current->item_changed = true;
+			snprintf(current->text_original, UI_TEXT_MAX, "%s", *value);
+		}
 		if (current->current_window != NULL) {
 			current->current_window->redraws = 2; // Keep redrawing window while typing
 		}
 	}
-	if (current->submit_text_handle == handle) {
-		ui_submit_text_edit();
+	if (current->submit_text_id == id) {
+		if (strcmp(*value, current->text_to_submit) != 0) {
+			current->item_changed = true;
+			*value                = string_copy(current->text_to_submit);
+		}
+		ui_finish_text_edit();
 	}
 
 	if (label[0] != '\0') {
@@ -2166,31 +2502,34 @@ char *ui_text_input(ui_handle_t *handle, char *label, int align, bool editable, 
 	}
 
 	draw_set_color(theme->TEXT_COL); // Text
-	if (current->text_selected_handle != handle) {
-		ui_draw_string(handle->text, theme->TEXT_OFFSET, 0, align, true);
+	if (current->text_selected_id != id) {
+		ui_draw_string((*value), theme->TEXT_OFFSET, 0, align, true);
 	}
 	else {
 		ui_draw_string(current->text_selected, theme->TEXT_OFFSET, 0, align, false);
 	}
 
 	ui_end_element();
-	return handle->text;
+	ui_record_change();
+	return (*value);
 }
 
-bool ui_check(ui_handle_t *handle, char *text, char *label) {
+bool ui_check(bool *value, char *text, char *label) {
+	current->item_changed = false;
 	if (!ui_is_visible(UI_ELEMENT_H())) {
 		ui_end_element();
-		return handle->b;
+		ui_record_change();
+		return (*value);
 	}
 	if (ui_get_released(UI_ELEMENT_H())) {
-		handle->b       = !handle->b;
-		handle->changed = current->changed = true;
+		(*value)              = !(*value);
+		current->item_changed = current->changed = true;
 	}
 	else
-		handle->changed = false;
+		current->item_changed = false;
 
 	bool hover = ui_get_hover(UI_ELEMENT_H());
-	ui_draw_check(handle->b, hover); // Check
+	ui_draw_check((*value), hover); // Check
 
 	draw_set_color(theme->TEXT_COL); // Text
 	ui_draw_string(text, current->title_offset_x, 0, UI_ALIGN_LEFT, true);
@@ -2202,24 +2541,24 @@ bool ui_check(ui_handle_t *handle, char *text, char *label) {
 
 	ui_end_element();
 
-	return handle->b;
+	ui_record_change();
+	return (*value);
 }
 
-bool ui_radio(ui_handle_t *handle, int position, char *text, char *label) {
+bool ui_radio(int *value, int position, char *text, char *label) {
+	current->item_changed = false;
 	if (!ui_is_visible(UI_ELEMENT_H())) {
 		ui_end_element();
-		return handle->i == position;
-	}
-	if (position == 0) {
-		handle->changed = false;
+		ui_record_change();
+		return (*value) == position;
 	}
 	if (ui_get_released(UI_ELEMENT_H())) {
-		handle->i       = position;
-		handle->changed = current->changed = true;
+		(*value)              = position;
+		current->item_changed = current->changed = true;
 	}
 
 	bool hover = ui_get_hover(UI_ELEMENT_H());
-	ui_draw_radio(handle->i == position, hover); // Radio
+	ui_draw_radio((*value) == position, hover); // Radio
 
 	draw_set_color(theme->TEXT_COL); // Text
 	ui_draw_string(text, current->title_offset_x, 0, UI_ALIGN_LEFT, true);
@@ -2231,51 +2570,76 @@ bool ui_radio(ui_handle_t *handle, int position, char *text, char *label) {
 
 	ui_end_element();
 
-	return handle->i == position;
+	ui_record_change();
+	return (*value) == position;
 }
 
-int ui_combo(ui_handle_t *handle, string_array_t *texts, char *label, bool show_label, int align, bool search_bar) {
-	if (!ui_is_visible(UI_ELEMENT_H())) {
-		ui_end_element();
-		return handle->i;
+void ui_combo_open(ui_id_t id, int value, string_array_t *texts, char *label, int align, bool search_bar) {
+	string_array_t *texts_copy = &current->combo_texts;
+	char           *label_copy = current->combo_label;
+	for (int i = 0; i < texts_copy->length; ++i) {
+		free(texts_copy->buffer[i]);
 	}
-	if (ui_get_released(UI_ELEMENT_H())) {
-		if (current->combo_selected_handle == NULL) {
-			current->input_enabled                 = false;
-			current->combo_selected_handle         = handle;
-			current->combo_selected_window         = current->current_window;
-			current->combo_selected_align          = align;
-			current->combo_selected_texts          = texts;
-			current->combo_selected_images         = NULL;
-			current->combo_selected_label          = label;
-			current->combo_selected_x              = current->_x + current->_window_x;
-			current->combo_selected_y              = current->_y + current->_window_y + UI_ELEMENT_H();
-			current->combo_selected_w              = current->_w;
-			current->combo_selected_texts_filtered = 0;
-			current->combo_search_bar              = search_bar;
-			for (int i = 0; i < texts->length; ++i) { // Adapt combo list width to combo item width
-				int w = (int)draw_string_width(current->ops->font, current->font_size, texts->buffer[i]) + 10;
-				if (current->combo_selected_w < w) {
-					current->combo_selected_w = w;
-				}
-			}
-			if (current->combo_selected_w > current->_w * 2.0) {
-				current->combo_selected_w = current->_w * 2.0;
-			}
-			if (current->combo_selected_w > current->_w) {
-				current->combo_selected_w += UI_TEXT_OFFSET();
-			}
-			current->combo_to_submit     = handle->i;
-			current->combo_initial_value = handle->i;
+	texts_copy->length = 0;
+	for (int i = 0; i < texts->length; ++i) {
+		string_array_push(texts_copy, string_copy(texts->buffer[i]));
+	}
+	if (label != NULL) {
+		strncpy(label_copy, label, sizeof(current->combo_label) - 1);
+		label_copy[sizeof(current->combo_label) - 1] = '\0';
+	}
+	current->input_enabled                 = false;
+	current->combo_selected_id             = id;
+	current->combo_selected_window         = current->current_window;
+	current->combo_selected_align          = align;
+	current->combo_selected_texts          = texts_copy;
+	current->combo_selected_images         = NULL;
+	current->combo_selected_label          = label != NULL ? label_copy : NULL;
+	current->combo_selected_x              = current->_x + current->_window_x;
+	current->combo_selected_y              = current->_y + current->_window_y + UI_ELEMENT_H();
+	current->combo_selected_w              = current->_w;
+	current->combo_selected_texts_filtered = 0;
+	current->combo_search_bar              = search_bar;
+	for (int i = 0; i < texts->length; ++i) { // Adapt combo list width to combo item width
+		int w = (int)draw_string_width(current->ops->font, current->font_size, texts->buffer[i]) + 10;
+		if (current->combo_selected_w < w) {
+			current->combo_selected_w = w;
 		}
 	}
-	if (handle == current->submit_combo_handle) {
-		handle->i                    = current->combo_to_submit;
-		current->submit_combo_handle = NULL;
-		handle->changed = current->changed = true;
+	if (current->combo_selected_w > current->_w * 2.0) {
+		current->combo_selected_w = current->_w * 2.0;
+	}
+	if (current->combo_selected_w > current->_w) {
+		current->combo_selected_w += UI_TEXT_OFFSET();
+	}
+	if (current->combo_selected_x + current->combo_selected_w > iron_window_width() - current->window_border_right) {
+		float x                   = current->_x + current->_window_x + current->_w - current->combo_selected_w;
+		current->combo_selected_x = x > 0 ? x : 0;
+	}
+	current->combo_to_submit     = value;
+	current->combo_initial_value = value;
+}
+
+int ui_combo(int *value, string_array_t *texts, char *label, bool show_label, int align, bool search_bar) {
+	current->item_changed = false;
+	ui_id_t id            = ui_widget_id(value, UI_ID_COMBO);
+	if (!ui_is_visible(UI_ELEMENT_H())) {
+		ui_end_element();
+		ui_record_change();
+		return (*value);
+	}
+	if (ui_get_released(UI_ELEMENT_H())) {
+		if (current->combo_selected_id == 0) {
+			ui_combo_open(id, (*value), texts, label, align, search_bar);
+		}
+	}
+	if (id == current->submit_combo_id) {
+		(*value)                 = current->combo_to_submit;
+		current->submit_combo_id = 0;
+		current->item_changed = current->changed = true;
 	}
 	else {
-		handle->changed = false;
+		current->item_changed = false;
 	}
 
 	draw_set_color(theme->PRESSED_COL); // Bg
@@ -2307,27 +2671,57 @@ int ui_combo(ui_handle_t *handle, string_array_t *texts, char *label, bool show_
 		current->_x -= 15;
 	}
 	draw_set_color(theme->TEXT_COL); // Value
-	if (handle->i < texts->length) {
-		ui_draw_string(texts->buffer[handle->i], theme->TEXT_OFFSET, 0, align, true);
+	if ((*value) >= 0 && (*value) < texts->length) {
+		ui_draw_string(texts->buffer[(*value)], theme->TEXT_OFFSET, 0, align, true);
 	}
 	if (align == UI_ALIGN_RIGHT) {
 		current->_x += 15;
 	}
 
 	ui_end_element();
-	return handle->i;
+	ui_record_change();
+	return (*value);
 }
 
-float ui_slider(ui_handle_t *handle, char *text, float from, float to, bool filled, float precision, bool display_value, int align, bool text_edit) {
+static void ui_decimal_comma_to_dot(char *text) {
+	if (strchr(text, '(') != NULL) {
+		return;
+	}
+	// 1,1 -> 1.1
+	for (char *c = text; *c != '\0'; ++c) {
+		if (*c == ',' && (c == text || isdigit((unsigned char)c[-1])) && isdigit((unsigned char)c[1])) {
+			*c = '.';
+		}
+	}
+}
+
+float ui_parse_float(char *text) {
+	ui_decimal_comma_to_dot(text);
+#ifdef WITH_EVAL
+	char expression[UI_TEXT_MAX + 64];
+	snprintf(expression, sizeof(expression), "float main() { return %s%s; }", text[0] == '.' ? "0" : "", text);
+	minic_ctx_t *ctx    = minic_eval(expression);
+	float        result = minic_ctx_result(ctx);
+	minic_ctx_free(ctx);
+	return result;
+#else
+	return atof(text);
+#endif
+}
+
+float ui_slider(float *value, char *text, float from, float to, bool filled, float precision, bool display_value, int align, bool text_edit) {
+	current->item_changed = false;
+	ui_id_t     id        = ui_widget_id(value, UI_ID_SLIDER);
 	static char temp[1024];
 	if (!ui_is_visible(UI_ELEMENT_H())) {
 		ui_end_element();
-		return handle->f;
+		ui_record_change();
+		return (*value);
 	}
 	if (ui_get_started(UI_ELEMENT_H())) {
-		current->scroll_handle = handle;
-		current->is_scrolling  = true;
-		current->changed = handle->changed = true;
+		current->slider_id    = id;
+		current->is_scrolling = true;
+		current->changed = current->item_changed = true;
 		if (ui_touch_control) {
 			current->slider_tooltip   = true;
 			current->slider_tooltip_x = current->_x + current->_window_x;
@@ -2336,59 +2730,49 @@ float ui_slider(ui_handle_t *handle, char *text, float from, float to, bool fill
 		}
 	}
 	else {
-		handle->changed = false;
+		current->item_changed = false;
 	}
 
 #if !defined(IRON_ANDROID) && !defined(IRON_IOS)
-	if (handle == current->scroll_handle && current->input_dx != 0) { // Scroll
+	if (id == current->slider_id && current->input_dx != 0) { // Scroll
 #else
-	if (handle == current->scroll_handle) { // Scroll
+	if (id == current->slider_id) { // Scroll
 #endif
 		float range    = to - from;
 		float slider_x = current->_x + current->_window_x + current->button_offset_y;
 		float slider_w = current->_w - current->button_offset_y * 2;
 		float step     = range / slider_w;
-		float value    = from + (current->input_x - slider_x) * step;
-		handle->f      = round(value * precision) / precision;
-		if (handle->f < from) {
-			handle->f = from; // Stay in bounds
+		float position = from + (current->input_x - slider_x) * step;
+		(*value)       = round(position * precision) / precision;
+		if ((*value) < from) {
+			(*value) = from; // Stay in bounds
 		}
-		else if (handle->f > to) {
-			handle->f = to;
+		else if ((*value) > to) {
+			(*value) = to;
 		}
-		handle->changed = current->changed = true;
+		current->item_changed = current->changed = true;
 	}
 
 	bool hover = ui_get_hover(UI_ELEMENT_H());
-	ui_draw_slider(handle->f, from, to, filled, hover); // Slider
+	ui_draw_slider((*value), from, to, filled, hover); // Slider
 
 	// Text edit
 	bool start_edit = (ui_get_released(UI_ELEMENT_H()) || current->tab_pressed) && text_edit;
 	if (start_edit) { // Mouse did not move
 		char tmp[256];
-		sprintf(tmp, "%.2f", handle->f);
-		handle->text = string_copy(tmp);
-		string_strip_trailing_zeros(handle->text);
-		ui_start_text_edit(handle, UI_ALIGN_LEFT);
-		handle->changed = current->changed = true;
+		sprintf(tmp, "%.2f", (*value));
+		string_strip_trailing_zeros(tmp);
+		ui_start_edit(id, tmp, UI_ALIGN_LEFT);
+		current->item_changed = current->changed = true;
 	}
 	int lalign = align == UI_ALIGN_LEFT ? UI_ALIGN_RIGHT : UI_ALIGN_LEFT;
-	if (current->text_selected_handle == handle) {
-		ui_update_text_edit(lalign, true, false);
+	if (current->text_selected_id == id) {
+		ui_update_text_edit(lalign, true);
 	}
-	if (current->submit_text_handle == handle) {
-		ui_submit_text_edit();
-#ifdef WITH_EVAL
-		if (handle->text[0] == '.') {
-			handle->text = string("0%s", handle->text);
-		}
-		minic_ctx_t *_ctx = minic_eval(string("float main() { return %s; }", handle->text));
-		handle->f         = minic_ctx_result(_ctx);
-		minic_ctx_free(_ctx);
-#else
-		handle->f = atof(handle->text);
-#endif
-		handle->changed = current->changed = true;
+	if (current->submit_text_id == id) {
+		(*value) = ui_parse_float(current->text_to_submit);
+		ui_finish_text_edit();
+		current->item_changed = current->changed = true;
 	}
 
 	draw_set_color(theme->LABEL_COL); // Text
@@ -2396,8 +2780,8 @@ float ui_slider(ui_handle_t *handle, char *text, float from, float to, bool fill
 
 	if (display_value) {
 		draw_set_color(theme->TEXT_COL); // Value
-		if (current->text_selected_handle != handle) {
-			sprintf(temp, "%.2f", round(handle->f * precision) / precision);
+		if (current->text_selected_id != id) {
+			sprintf(temp, "%.2f", round((*value) * precision) / precision);
 			string_strip_trailing_zeros(temp);
 			ui_draw_string(temp, theme->TEXT_OFFSET, 0, lalign, true);
 		}
@@ -2406,8 +2790,11 @@ float ui_slider(ui_handle_t *handle, char *text, float from, float to, bool fill
 		}
 	}
 
+	if (current->slider_id == id)
+		current->slider_value = *value;
 	ui_end_element();
-	return handle->f;
+	ui_record_change();
+	return (*value);
 }
 
 void ui_separator(int h, bool fill) {
@@ -2423,9 +2810,13 @@ void ui_separator(int h, bool fill) {
 }
 
 void ui_tooltip(char *text) {
-	assert(strlen(text) < 512);
-	strcpy(current->tooltip_text, text);
-	current->tooltip_y = current->_y + current->_window_y;
+	size_t len = strlen(text);
+	if (len > sizeof(current->tooltip_text) - 1) {
+		len = sizeof(current->tooltip_text) - 1;
+	}
+	memcpy(current->tooltip_text, text, len);
+	current->tooltip_text[len] = '\0';
+	current->tooltip_y         = current->_y + current->_window_y;
 }
 
 void ui_tooltip_image(gpu_texture_t *image, int max_width) {
@@ -2438,7 +2829,7 @@ void ui_end() {
 	if (!current->window_ended) {
 		ui_end_window();
 	}
-	current->tab_pressed_handle = NULL;
+	current->tab_pressed_id = 0;
 }
 
 void ui_set_input_position(ui_t *ui, int x, int y) {
@@ -2473,6 +2864,13 @@ void ui_mouse_down(ui_t *ui, int button, int x, int y) {
 
 void ui_mouse_move(ui_t *ui, int x, int y, int movement_x, int movement_y) {
 #if !defined(IRON_ANDROID) && !defined(IRON_IOS)
+	if (iron_mouse_movement_only) {
+		ui->input_dx += movement_x;
+		ui->input_dy += movement_y;
+		ui->input_started_x -= movement_x;
+		ui->input_started_y -= movement_y;
+		return;
+	}
 	ui_set_input_position(ui, x, y);
 #endif
 }
@@ -2490,6 +2888,7 @@ void ui_mouse_up(ui_t *ui, int button, int x, int y) {
 	if (ui->is_scrolling) { // Prevent action when scrolling is active
 		ui->is_scrolling   = false;
 		ui->scroll_handle  = NULL;
+		ui->slider_id      = 0;
 		ui->slider_tooltip = false;
 		if (x == ui->input_started_x && y == ui->input_started_y) { // Mouse not moved
 			if (button == 0)
@@ -2575,7 +2974,7 @@ void ui_key_down(ui_t *ui, int key_code) {
 	case KEY_CODE_CONTROL:
 		ui->is_ctrl_down = true;
 		break;
-#ifdef IRON_DARWIN
+#ifdef IRON_MACOS
 	case KEY_CODE_META:
 		ui->is_ctrl_down = true;
 		break;
@@ -2622,7 +3021,7 @@ void ui_key_up(ui_t *ui, int key_code) {
 	case KEY_CODE_CONTROL:
 		ui->is_ctrl_down = false;
 		break;
-#ifdef IRON_DARWIN
+#ifdef IRON_MACOS
 	case KEY_CODE_META:
 		ui->is_ctrl_down = false;
 		break;
@@ -2725,20 +3124,19 @@ void ui_touch_move(ui_t *ui, int index, int x, int y) {
 }
 #endif
 
-char *ui_copy() {
+void ui_copy() {
 	ui_is_copy = true;
-	return &ui_text_to_copy[0];
 }
 
-char *ui_cut() {
+void ui_cut() {
 	ui_is_cut = true;
-	return ui_copy();
+	ui_copy();
 }
 
 void ui_paste(char *s) {
 	ui_is_paste = true;
-	strncpy(ui_text_to_paste, s, 8192);
-	ui_text_to_paste[8191] = 0;
+	strncpy(ui_text_to_paste, s, UI_TEXT_MAX - 1);
+	ui_text_to_paste[UI_TEXT_MAX - 1] = 0;
 }
 
 void ui_theme_default(ui_theme_t *t) {
@@ -2747,7 +3145,7 @@ void ui_theme_default(ui_theme_t *t) {
 	t->BUTTON_COL        = 0xff323232;
 	t->PRESSED_COL       = 0xff212121;
 	t->TEXT_COL          = 0xfff7f7f7;
-	t->LABEL_COL         = 0xffcfcfcf;
+	t->LABEL_COL         = 0xffc4c4c4;
 	t->SEPARATOR_COL     = 0xff202020;
 	t->HIGHLIGHT_COL     = 0xff205d9c;
 	t->FONT_SIZE         = 13;

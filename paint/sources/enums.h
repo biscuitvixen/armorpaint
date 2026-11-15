@@ -69,31 +69,42 @@ typedef enum {
 	VIEWPORT_MODE_SUBSURFACE    = 9,
 	VIEWPORT_MODE_TEXCOORD      = 10,
 	VIEWPORT_MODE_OBJECT_NORMAL = 11,
-	VIEWPORT_MODE_MATERIAL_ID   = 12,
-	VIEWPORT_MODE_OBJECT_ID     = 13,
-	VIEWPORT_MODE_MASK          = 14,
-	VIEWPORT_MODE_PATH_TRACE    = 15,
+	VIEWPORT_MODE_WORLD_NORMAL  = 12,
+	VIEWPORT_MODE_MATERIAL_ID   = 13,
+	VIEWPORT_MODE_OBJECT_ID     = 14,
+	VIEWPORT_MODE_MASK          = 15,
+	VIEWPORT_MODE_PATH_TRACE    = 16,
+	VIEWPORT_MODE_PLUGIN        = 17,
 } viewport_mode_t;
 
 typedef enum {
-	WORKSPACE_PAINT_3D = 0,
-	WORKSPACE_PAINT_2D = 1,
-	WORKSPACE_NODES    = 2,
-	WORKSPACE_SCRIPT   = 3,
-	WORKSPACE_PLAYER   = 4,
-} workspace_t;
+	RENDER_PASS_LIGHT,
+	RENDER_PASS_POST,
+} render_pass_stage_t;
+
+// Layouts to reset the docked tabs to
+typedef enum {
+	WORKSPACE_PRESET_NONE    = -1, // Saved layout
+	WORKSPACE_PRESET_VIEW_3D = 0,
+	WORKSPACE_PRESET_VIEW_2D = 1,
+	WORKSPACE_PRESET_NODES   = 2,
+	WORKSPACE_PRESET_SCRIPT  = 3,
+} workspace_preset_t;
 
 typedef enum {
-	WORKFLOW_PBR    = 0,
-	WORKFLOW_BASE   = 1,
-	WORKFLOW_SCULPT = 2,
-} workflow_t;
+	TOOLS_PAINT  = 0,
+	TOOLS_SCULPT = 1,
+	TOOLS_OBJECT = 2,
+} tools_t;
 
 typedef enum {
-	RENDER_MODE_DEFERRED   = 0,
-	RENDER_MODE_FORWARD    = 1,
-	RENDER_MODE_PATH_TRACE = 2,
-} render_mode_t;
+	PLATFORM_WINDOWS = 0,
+	PLATFORM_LINUX   = 1,
+	PLATFORM_MACOS   = 2,
+	PLATFORM_IOS     = 3,
+	PLATFORM_ANDROID = 4,
+	PLATFORM_WASM    = 5,
+} platform_t;
 
 typedef enum {
 	EXPORT_MODE_VISIBLE       = 0,
@@ -108,8 +119,8 @@ typedef enum {
 } export_destination_t;
 
 typedef enum {
-	PATHTRACE_MODE_FAST    = 0,
-	PATHTRACE_MODE_QUALITY = 1,
+	PATHTRACE_MODE_FAST = 0,
+	PATHTRACE_MODE_FULL = 1,
 } pathtrace_mode_t;
 
 typedef enum {
@@ -117,6 +128,8 @@ typedef enum {
 	FILL_TYPE_FACE      = 1,
 	FILL_TYPE_ANGLE     = 2,
 	FILL_TYPE_UV_ISLAND = 3,
+	FILL_TYPE_MESH      = 4,
+	FILL_TYPE_SUBMESH   = 5,
 } fill_type_t;
 
 typedef enum {
@@ -126,8 +139,18 @@ typedef enum {
 } uv_type_t;
 
 typedef enum {
-	SCULPT_TYPE_DRAW = 0,
-	SCULPT_TYPE_GRAB = 1,
+	SCULPT_TYPE_DRAW    = 0,
+	SCULPT_TYPE_GRAB    = 1,
+	SCULPT_TYPE_INFLATE = 2,
+	SCULPT_TYPE_FLATTEN = 3,
+	SCULPT_TYPE_CLAY    = 4,
+	SCULPT_TYPE_PINCH   = 5,
+	SCULPT_TYPE_CREASE  = 6,
+	SCULPT_TYPE_CLOTH   = 7,
+	SCULPT_TYPE_TWIST   = 8,
+	SCULPT_TYPE_STRETCH = 9,
+	SCULPT_TYPE_TRIM    = 10,
+	SCULPT_TYPE_PLATEAU = 11,
 } sculpt_type_t;
 
 typedef enum {
@@ -188,7 +211,14 @@ typedef enum {
 typedef enum {
 	CANVAS_TYPE_MATERIAL = 0,
 	CANVAS_TYPE_BRUSH    = 1,
+	CANVAS_TYPE_MESH     = 2,
 } canvas_type_t;
+
+typedef enum {
+	MESH_BOOLEAN_UNION      = 0,
+	MESH_BOOLEAN_DIFFERENCE = 1,
+	MESH_BOOLEAN_INTERSECT  = 2,
+} mesh_boolean_t;
 
 typedef enum {
 	VIEW_2D_TYPE_ASSET = 0,
@@ -196,6 +226,7 @@ typedef enum {
 	VIEW_2D_TYPE_FONT  = 2,
 	VIEW_2D_TYPE_LAYER = 3,
 	VIEW_2D_TYPE_UVMAP = 4,
+	VIEW_2D_TYPE_SOUND = 5,
 } view_2d_type_t;
 
 typedef enum {
@@ -229,20 +260,32 @@ typedef enum {
 } layer_slot_type_t;
 
 typedef enum {
-	TOOL_TYPE_BRUSH    = 0,
-	TOOL_TYPE_ERASER   = 1,
-	TOOL_TYPE_FILL     = 2,
-	TOOL_TYPE_DECAL    = 3,
-	TOOL_TYPE_TEXT     = 4,
-	TOOL_TYPE_CLONE    = 5,
-	TOOL_TYPE_BLUR     = 6,
-	TOOL_TYPE_PARTICLE = 7,
-	TOOL_TYPE_COLORID  = 8,
-	TOOL_TYPE_PICKER   = 9,
-	TOOL_TYPE_MATERIAL = 10,
-	TOOL_TYPE_CURSOR   = 11,
-	TOOL_TYPE_SELECT   = 12,
-	TOOL_TYPE_BAKE     = 13, // Hidden, used by Bake Texture node
+	TOOL_TYPE_BRUSH     = 0,
+	TOOL_TYPE_ERASER    = 1,
+	TOOL_TYPE_FILL      = 2,
+	TOOL_TYPE_DECAL     = 3,
+	TOOL_TYPE_TEXT      = 4,
+	TOOL_TYPE_CLONE     = 5,
+	TOOL_TYPE_BLUR      = 6,
+	TOOL_TYPE_PARTICLE  = 7,
+	TOOL_TYPE_COLORID   = 8,
+	TOOL_TYPE_PICKER    = 9,
+	TOOL_TYPE_MATERIAL  = 10,
+	TOOL_TYPE_CURSOR    = 11,
+	TOOL_TYPE_SELECT    = 12,
+	TOOL_TYPE_EMPTY     = 13, // Object tools only, see util_tool_is_object_tool
+	TOOL_TYPE_PLANE     = 14,
+	TOOL_TYPE_CUBE      = 15,
+	TOOL_TYPE_SPHERE    = 16,
+	TOOL_TYPE_CONE      = 17,
+	TOOL_TYPE_CYLINDER  = 18,
+	TOOL_TYPE_CAPSULE   = 19,
+	TOOL_TYPE_TORUS     = 20,
+	TOOL_TYPE_TEXT_MESH = 21,
+	TOOL_TYPE_PATH      = 22,
+	TOOL_TYPE_CURVE     = 23,
+	TOOL_TYPE_BAKE      = 24, // Hidden, used by Bake Texture node
+	TOOL_TYPE_PLUGIN    = 25, // First tool added by plugins, see plugin_register_tool
 } tool_type_t;
 
 typedef enum {
@@ -251,10 +294,61 @@ typedef enum {
 } blur_type_t;
 
 typedef enum {
+	SELECT_MODE_RECTANGLE = 0,
+	SELECT_MODE_ELLIPSE   = 1,
+	SELECT_MODE_POLYGON   = 2,
+} select_mode_t;
+
+typedef enum {
+	CLONE_LAYERS_SELECTED = 0,
+	CLONE_LAYERS_VISIBLE  = 1,
+} clone_layers_t;
+
+typedef enum {
 	TAB_AREA_SIDEBAR0 = 0,
 	TAB_AREA_SIDEBAR1 = 1,
 	TAB_AREA_STATUS   = 2,
 } tab_area_t;
+
+// Stored in config, append only
+typedef enum {
+	TAB_LAYERS    = 0,
+	TAB_MESHES    = 1,
+	TAB_SCRIPTS   = 2,
+	TAB_MATERIALS = 3,
+	TAB_BRUSHES   = 4,
+	TAB_PLUGINS   = 5,
+	TAB_BROWSER   = 6,
+	TAB_TEXTURES  = 7,
+	TAB_FONTS     = 8,
+	TAB_SOUNDS    = 9,
+	TAB_SWATCHES  = 10,
+	TAB_TIMELINE  = 11,
+	TAB_CONSOLE   = 12,
+	TAB_DEBUG     = 13,
+	TAB_VIEW3D    = 14,
+	TAB_VIEW2D    = 15,
+	TAB_NODES     = 16,
+	TAB_COUNT     = 17,
+} tab_id_t;
+
+typedef enum {
+	DOCK_ZONE_CENTER = 0,
+	DOCK_ZONE_LEFT   = 1,
+	DOCK_ZONE_RIGHT  = 2,
+	DOCK_ZONE_TOP    = 3,
+	DOCK_ZONE_BOTTOM = 4,
+} dock_zone_t;
+
+// Splits of the default layout, stored in config
+typedef enum {
+	DOCK_ROLE_NONE          = 0,
+	DOCK_ROLE_SIDEBAR       = 1,
+	DOCK_ROLE_SIDEBAR_INNER = 2,
+	DOCK_ROLE_STATUS        = 3,
+	DOCK_ROLE_VIEWS         = 4,
+	DOCK_ROLE_VIEWS_INNER   = 5,
+} dock_role_t;
 
 typedef enum {
 	TEXTURE_RES_RES2048  = 0,
@@ -265,14 +359,11 @@ typedef enum {
 } texture_res_t;
 
 typedef enum {
-	LAYOUT_SIZE_SIDEBAR_W  = 0,
-	LAYOUT_SIZE_SIDEBAR_H0 = 1,
-	LAYOUT_SIZE_SIDEBAR_H1 = 2,
-	LAYOUT_SIZE_NODES_W    = 3,
-	LAYOUT_SIZE_NODES_H    = 4,
-	LAYOUT_SIZE_STATUS_H   = 5,
-	LAYOUT_SIZE_HEADER     = 6, // 0 - hidden, 1 - visible
-} layout_size_t;
+	CONSOLE_MODEL_QWEN   = 0,
+	CONSOLE_MODEL_CLAUDE = 1,
+	CONSOLE_MODEL_GROK   = 2,
+	CONSOLE_MODEL_CODEX  = 3,
+} console_model_t;
 
 typedef enum {
 	PREFERENCES_TAB_INTERFACE = 0,
@@ -283,16 +374,9 @@ typedef enum {
 	PREFERENCES_TAB_VIEWPORT  = 5,
 	PREFERENCES_TAB_KEYMAP    = 6,
 	PREFERENCES_TAB_NEURAL    = 7,
-	PREFERENCES_TAB_PLUGINS   = 8,
+	PREFERENCES_TAB_CLOUD     = 8,
+	PREFERENCES_TAB_PLUGINS   = 9,
 } preferences_tab_t;
-
-typedef enum {
-	PHYSICS_SHAPE_BOX     = 0,
-	PHYSICS_SHAPE_SPHERE  = 1,
-	PHYSICS_SHAPE_HULL    = 2,
-	PHYSICS_SHAPE_TERRAIN = 3,
-	PHYSICS_SHAPE_MESH    = 4,
-} physics_shape_t;
 
 typedef enum {
 	ICON18_EYE_ON  = 0,
@@ -433,9 +517,9 @@ typedef enum {
 	ICON_TERMINAL         = 129,
 	ICON_TRANSLATE        = 130,
 	ICON_UPLOAD           = 131,
-	ICON_RESERVED0        = 132,
-	ICON_RESERVED1        = 133,
-	ICON_RESERVED2        = 134,
+	ICON_EMPTY            = 132,
+	ICON_CAPSULE          = 133,
+	ICON_TEXT3D           = 134,
 	ICON_RESERVED3        = 135,
 	ICON_RESERVED4        = 136,
 	ICON_WORKSPACE        = 137,
@@ -445,7 +529,25 @@ typedef enum {
 	ICON_CYLINDER         = 141,
 	ICON_CONE             = 142,
 	ICON_BOX              = 143,
+	ICON_SCULPT_DRAW      = 144,
+	ICON_SCULPT_GRAB      = 145,
+	ICON_SCULPT_INFLATE   = 146,
+	ICON_SCULPT_FLATTEN   = 147,
+	ICON_SCULPT_CLAY      = 148,
+	ICON_SCULPT_PINCH     = 149,
+	ICON_SCULPT_CREASE    = 150,
+	ICON_SCULPT_CLOTH     = 151,
+	ICON_SCULPT_TWIST     = 152,
+	ICON_SCULPT_STRETCH   = 153,
+	ICON_SCULPT_TRIM      = 154,
+	ICON_SCULPT_PLATEAU   = 155,
+	ICON_RESERVED5        = 156, // icon18 strip at the bottom edge
 } icon_t;
+
+typedef enum {
+	SWATCH_DISPLAY_2D,
+	SWATCH_DISPLAY_3D,
+} swatch_display_t;
 
 typedef enum {
 	COLOR_SPACE_AUTO, // sRGB for base color, otherwise linear
@@ -480,9 +582,19 @@ typedef enum {
 	HISTORY_ACTION_NEW_MATERIAL,
 	HISTORY_ACTION_DELETE_MATERIAL,
 	HISTORY_ACTION_DUPLICATE_MATERIAL,
+	HISTORY_ACTION_LAYER_VISIBLE,
+	HISTORY_ACTION_LAYER_NAME,
+	HISTORY_ACTION_LAYER_OBJECT,
+	HISTORY_ACTION_LAYER_SCALE,
+	HISTORY_ACTION_LAYER_ANGLE,
+	HISTORY_ACTION_LAYER_UV_TYPE,
+	HISTORY_ACTION_NEW_BRUSH,
+	HISTORY_ACTION_DELETE_BRUSH,
+	HISTORY_ACTION_DUPLICATE_BRUSH,
+	HISTORY_ACTION_NEW_SWATCH,
+	HISTORY_ACTION_DELETE_SWATCH,
+	HISTORY_ACTION_DUPLICATE_SWATCH,
+	HISTORY_ACTION_REPLACE_SWATCHES,
+	HISTORY_ACTION_EDIT_SWATCH,
+	HISTORY_ACTION_OBJECT_TRANSFORM,
 } history_action_t;
-
-typedef enum {
-	OPACITY_MODE_ALPHA,
-	OPACITY_MODE_TRANSLUC,
-} opacity_mode_t;

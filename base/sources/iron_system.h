@@ -2,6 +2,8 @@
 
 #include "iron_array.h"
 #include "iron_global.h"
+#include "iron_gpu.h"
+#include "iron_map.h"
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -112,8 +114,8 @@ void iron_set_pause_callback(void (*callback)(void *), void *data);
 void iron_set_background_callback(void (*callback)(void *), void *data);
 void iron_set_shutdown_callback(void (*callback)(void *), void *data);
 void iron_set_drop_files_callback(void (*callback)(char *, void *), void *data);
-void iron_set_cut_callback(char *(*callback)(void *), void *data);
-void iron_set_copy_callback(char *(*callback)(void *), void *data);
+void iron_set_cut_callback(void (*callback)(void *), void *data);
+void iron_set_copy_callback(void (*callback)(void *), void *data);
 void iron_set_paste_callback(void (*callback)(char *, void *), void *data);
 
 bool        iron_internal_frame(void);
@@ -125,8 +127,8 @@ void        iron_internal_foreground_callback(void);
 void        iron_internal_background_callback(void);
 void        iron_internal_shutdown_callback(void);
 void        iron_internal_drop_files_callback(char *);
-char       *iron_internal_cut_callback(void);
-char       *iron_internal_copy_callback(void);
+void        iron_internal_cut_callback(void);
+void        iron_internal_copy_callback(void);
 void        iron_internal_paste_callback(char *);
 
 typedef enum {
@@ -274,52 +276,55 @@ typedef enum {
 	KEY_CODE_ALT_GR              = 225,
 } key_code_t;
 
-void iron_keyboard_show(void);
-void iron_keyboard_hide(void);
-bool iron_keyboard_active(void);
-void iron_keyboard_set_key_down_callback(void (*value)(int /*key_code*/, void * /*data*/), void *data);
-void iron_keyboard_set_key_up_callback(void (*value)(int /*key_code*/, void * /*data*/), void *data);
-void iron_keyboard_set_key_press_callback(void (*value)(unsigned /*character*/, void * /*data*/), void *data);
-void iron_internal_keyboard_trigger_key_down(int key_code);
-void iron_internal_keyboard_trigger_key_up(int key_code);
-void iron_internal_keyboard_trigger_key_press(unsigned character);
-void iron_mouse_set_press_callback(void (*value)(int /*button*/, int /*x*/, int /*y*/, void * /*data*/), void *data);
-void iron_mouse_set_release_callback(void (*value)(int /*button*/, int /*x*/, int /*y*/, void * /*data*/), void *data);
-void iron_mouse_set_move_callback(void (*value)(int /*x*/, int /*y*/, int /*movement_x*/, int /*movement_y*/, void * /*data*/), void *data);
-void iron_mouse_set_scroll_callback(void (*value)(float /*delta*/, void * /*data*/), void *data);
-bool iron_mouse_can_lock(void);
-bool iron_mouse_is_locked(void);
-void iron_mouse_lock();
-void iron_mouse_unlock(void);
-void iron_mouse_set_cursor(iron_cursor_t cursor);
-void iron_mouse_show(void);
-void iron_mouse_hide(void);
-void iron_mouse_set_position(int x, int y);
-void iron_mouse_get_position(int *x, int *y);
-void iron_internal_mouse_trigger_press(int button, int x, int y);
-void iron_internal_mouse_trigger_release(int button, int x, int y);
-void iron_internal_mouse_trigger_move(int x, int y);
-void iron_internal_mouse_trigger_scroll(float delta);
-void iron_internal_mouse_window_activated();
-void iron_internal_mouse_window_deactivated();
-void iron_pen_set_press_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
-void iron_pen_set_move_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
-void iron_pen_set_release_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
-void iron_eraser_set_press_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
-void iron_eraser_set_move_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
-void iron_eraser_set_release_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
-void iron_internal_pen_trigger_move(int x, int y, float pressure);
-void iron_internal_pen_trigger_press(int x, int y, float pressure);
-void iron_internal_pen_trigger_release(int x, int y, float pressure);
-void iron_internal_eraser_trigger_move(int x, int y, float pressure);
-void iron_internal_eraser_trigger_press(int x, int y, float pressure);
-void iron_internal_eraser_trigger_release(int x, int y, float pressure);
-void iron_surface_set_touch_start_callback(void (*value)(int /*index*/, int /*x*/, int /*y*/));
-void iron_surface_set_move_callback(void (*value)(int /*index*/, int /*x*/, int /*y*/));
-void iron_surface_set_touch_end_callback(void (*value)(int /*index*/, int /*x*/, int /*y*/));
-void iron_internal_surface_trigger_touch_start(int index, int x, int y);
-void iron_internal_surface_trigger_move(int index, int x, int y);
-void iron_internal_surface_trigger_touch_end(int index, int x, int y);
+void        iron_keyboard_show(void);
+void        iron_keyboard_hide(void);
+bool        iron_keyboard_active(void);
+void        iron_keyboard_set_key_down_callback(void (*value)(int /*key_code*/, void        */*data*/), void *data);
+void        iron_keyboard_set_key_up_callback(void (*value)(int /*key_code*/, void        */*data*/), void *data);
+void        iron_keyboard_set_key_press_callback(void (*value)(unsigned /*character*/, void        */*data*/), void *data);
+void        iron_internal_keyboard_trigger_key_down(int key_code);
+void        iron_internal_keyboard_trigger_key_up(int key_code);
+void        iron_internal_keyboard_trigger_key_press(unsigned character);
+void        iron_mouse_set_press_callback(void (*value)(int /*button*/, int /*x*/, int /*y*/, void        */*data*/), void *data);
+void        iron_mouse_set_release_callback(void (*value)(int /*button*/, int /*x*/, int /*y*/, void        */*data*/), void *data);
+void        iron_mouse_set_move_callback(void (*value)(int /*x*/, int /*y*/, int /*movement_x*/, int /*movement_y*/, void        */*data*/), void *data);
+void        iron_mouse_set_scroll_callback(void (*value)(float /*delta*/, void        */*data*/), void *data);
+bool        iron_mouse_can_lock(void);
+bool        iron_mouse_is_locked(void);
+extern bool iron_mouse_trackpad_drag;
+extern bool iron_mouse_movement_only;
+void        iron_mouse_lock();
+void        iron_mouse_unlock(void);
+void        iron_mouse_set_cursor(iron_cursor_t cursor);
+void        iron_mouse_show(void);
+void        iron_mouse_hide(void);
+void        iron_mouse_set_position(int x, int y);
+void        iron_mouse_get_position(int *x, int *y);
+void        iron_internal_mouse_trigger_press(int button, int x, int y);
+void        iron_internal_mouse_trigger_release(int button, int x, int y);
+void        iron_internal_mouse_trigger_move(int x, int y);
+void        iron_internal_mouse_trigger_scroll(float delta);
+void        iron_internal_mouse_trigger_movement(int movement_x, int movement_y);
+void        iron_internal_mouse_window_activated();
+void        iron_internal_mouse_window_deactivated();
+void        iron_pen_set_press_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
+void        iron_pen_set_move_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
+void        iron_pen_set_release_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
+void        iron_eraser_set_press_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
+void        iron_eraser_set_move_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
+void        iron_eraser_set_release_callback(void (*value)(int /*x*/, int /*y*/, float /*pressure*/));
+void        iron_internal_pen_trigger_move(int x, int y, float pressure);
+void        iron_internal_pen_trigger_press(int x, int y, float pressure);
+void        iron_internal_pen_trigger_release(int x, int y, float pressure);
+void        iron_internal_eraser_trigger_move(int x, int y, float pressure);
+void        iron_internal_eraser_trigger_press(int x, int y, float pressure);
+void        iron_internal_eraser_trigger_release(int x, int y, float pressure);
+void        iron_surface_set_touch_start_callback(void (*value)(int /*index*/, int /*x*/, int /*y*/));
+void        iron_surface_set_move_callback(void (*value)(int /*index*/, int /*x*/, int /*y*/));
+void        iron_surface_set_touch_end_callback(void (*value)(int /*index*/, int /*x*/, int /*y*/));
+void        iron_internal_surface_trigger_touch_start(int index, int x, int y);
+void        iron_internal_surface_trigger_move(int index, int x, int y);
+void        iron_internal_surface_trigger_touch_end(int index, int x, int y);
 
 #ifdef WITH_GAMEPAD
 #define IRON_GAMEPAD_MAX_COUNT 8
@@ -340,3 +345,96 @@ void        iron_internal_gamepad_trigger_button(int gamepad, int button, float 
 i32             iron_sys_command(char *cmd);
 string_array_t *iron_open_dialog(char *filter_list, char *default_path, bool open_multiple);
 char           *iron_save_dialog(char *filter_list, char *default_path);
+#ifdef IRON_WASM
+char *iron_folder_dialog(char *name);
+#endif
+
+extern any_map_t   *_sys_shaders;
+extern f64          _sys_start_time;
+extern any_array_t *_sys_on_next_frames;
+extern any_array_t *_sys_on_end_frames;
+extern any_array_t *_sys_on_updates;
+extern i32          _sys_lastw;
+extern i32          _sys_lasth;
+extern any_array_t *_sys_foreground_listeners;
+extern any_array_t *_sys_background_listeners;
+extern any_array_t *_sys_shutdown_listeners;
+extern any_array_t *_sys_drop_files_listeners;
+
+extern void (*sys_on_resize)(void);
+extern i32 (*sys_on_w)(void);
+extern i32 (*sys_on_h)(void);
+extern i32 (*sys_on_x)(void);
+extern i32 (*sys_on_y)(void);
+
+typedef struct sys_callback {
+	void (*f)(void);
+} sys_callback_t;
+
+typedef struct sys_string_callback {
+	void (*f)(char *s);
+} sys_string_callback_t;
+
+typedef struct callback {
+	void (*f)(void *data);
+	void *data;
+} callback_t;
+
+void          sys_start(iron_window_options_t *ops);
+f64           sys_time(void);
+f64           sys_delta(void);
+f64           sys_real_delta(void);
+i32           sys_w(void);
+i32           sys_h(void);
+i32           sys_x(void);
+i32           sys_y(void);
+char         *sys_title(void);
+void          sys_title_set(char *value);
+i32           sys_display_primary_id(void);
+i32           sys_display_width(void);
+i32           sys_display_height(void);
+i32           sys_display_frequency(void);
+i32           sys_display_ppi(void);
+char         *sys_shader_ext(void);
+gpu_shader_t *sys_get_shader(char *name);
+void          sys_notify_on_app_state(void (*on_foreground)(void), void (*on_background)(void), void (*on_shutdown)(void));
+void          sys_notify_on_drop_files(void (*drop_files_listener)(char *s));
+void          sys_notify_on_update(void (*f)(void *data), void *data);
+void          sys_notify_on_next_frame(void (*f)(void *data), void *data);
+void          sys_notify_on_end_frame(void (*f)(void *data), void *data);
+void          sys_remove_update(void (*f)(void *data));
+void          sys_render(void);
+void          sys_foreground(void);
+void          sys_resume(void);
+void          sys_pause(void);
+void          sys_background(void);
+void          sys_shutdown(void);
+void          sys_drop_files(char *file_path);
+void          sys_foreground_callback(void);
+void          sys_background_callback(void);
+void          sys_shutdown_callback(void);
+void          sys_drop_files_callback(char *file_path);
+void          sys_keyboard_down_callback(i32 code);
+void          sys_keyboard_up_callback(i32 code);
+void          sys_mouse_down_callback(i32 button, i32 x, i32 y);
+void          sys_mouse_up_callback(i32 button, i32 x, i32 y);
+void          sys_mouse_move_callback(i32 x, i32 y, i32 mx, i32 my);
+void          sys_mouse_wheel_callback(f32 delta);
+void          sys_touch_down_callback(i32 index, i32 x, i32 y);
+void          sys_touch_up_callback(i32 index, i32 x, i32 y);
+void          sys_touch_move_callback(i32 index, i32 x, i32 y);
+void          sys_pen_down_callback(i32 x, i32 y, f32 pressure);
+void          sys_pen_up_callback(i32 x, i32 y, f32 pressure);
+void          sys_pen_move_callback(i32 x, i32 y, f32 pressure);
+char         *sys_buffer_to_string(buffer_t *b);
+buffer_t     *sys_string_to_buffer(char *str);
+char         *data_path(void);
+void          scene_render_frame(void);
+#ifdef WITH_GAMEPAD
+void sys_gamepad_axis_callback(i32 gamepad, i32 axis, f32 value);
+void sys_gamepad_button_callback(i32 gamepad, i32 button, f32 value);
+#endif
+
+typedef struct {
+	void *video_;
+} video_t;

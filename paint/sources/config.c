@@ -8,6 +8,10 @@ typedef struct version {
 
 bool config_loaded = false;
 
+#ifdef IRON_MACOS
+float iron_display_backing_scale(void);
+#endif
+
 void config_load() {
 	char *path = "";
 	if (path_is_protected()) {
@@ -23,6 +27,7 @@ void config_load() {
 		blob = data_get_blob(path);
 		if (blob == NULL) {
 			path_is_protected_linux = true;
+			free(path);
 			config_load();
 			return;
 		}
@@ -31,17 +36,15 @@ void config_load() {
 
 	if (blob != NULL) {
 		char *config_string = sys_buffer_to_string(blob);
-		if (starts_with(config_string, "{\"version\":")) { // Ensure valid config
-			config_loaded = true;
-			gc_unroot(g_config);
-			g_config = json_parse(config_string);
-			gc_root(g_config);
-		}
+		g_config            = config_from_json(config_string);
+		config_loaded       = g_config != NULL;
+		free(config_string);
 	}
+	free(path);
 }
 
 void config_save() {
-	if (g_config->workspace == WORKSPACE_PLAYER) {
+	if (base_player) {
 		return;
 	}
 
@@ -71,7 +74,7 @@ void config_save() {
 	json_encode_i32("window_frequency", g_config->window_frequency);
 	json_encode_f32("window_scale", g_config->window_scale);
 	json_encode_f32("rp_supersample", g_config->rp_supersample);
-	json_encode_bool("rp_ssao", g_config->rp_ssao);
+	json_encode_f32("rp_ssao", g_config->rp_ssao);
 	json_encode_f32("rp_bloom", g_config->rp_bloom);
 	json_encode_f32("rp_vignette", g_config->rp_vignette);
 	json_encode_f32("rp_grain", g_config->rp_grain);
@@ -93,14 +96,12 @@ void config_save() {
 	json_encode_i32("zoom_direction", g_config->zoom_direction);
 	json_encode_bool("wrap_mouse", g_config->wrap_mouse);
 	json_encode_bool("show_asset_names", g_config->show_asset_names);
+	json_encode_bool("material_params", g_config->material_params);
+	json_encode_bool("brush_params", g_config->brush_params);
+	json_encode_bool("mesh_params", g_config->mesh_params);
 	json_encode_bool("touch_ui", g_config->touch_ui);
 	json_encode_bool("splash_screen", g_config->splash_screen);
-	if (g_config->layout != NULL) {
-		json_encode_i32_array("layout", g_config->layout);
-	}
-	else {
-		json_encode_null("layout");
-	}
+	json_encode_bool("header_pinned", g_config->header_pinned);
 	if (g_config->layout_tabs != NULL) {
 		json_encode_i32_array("layout_tabs", g_config->layout_tabs);
 	}
@@ -112,6 +113,7 @@ void config_save() {
 	json_encode_string("server", g_config->server);
 	json_encode_i32("viewport_mode", g_config->viewport_mode);
 	json_encode_i32("pathtrace_mode", g_config->pathtrace_mode);
+	json_encode_i32("pathtrace_frames", g_config->pathtrace_frames);
 	json_encode_bool("pressure_radius", g_config->pressure_radius);
 	json_encode_f32("pressure_sensitivity", g_config->pressure_sensitivity);
 	json_encode_i32("layer_res", g_config->layer_res);
@@ -126,208 +128,334 @@ void config_save() {
 	json_encode_f32("brush_alpha_discard", g_config->brush_alpha_discard);
 	json_encode_i32("dilate_radius", g_config->dilate_radius);
 	json_encode_string("blender", g_config->blender);
-	json_encode_i32("scene_atlas_res", g_config->scene_atlas_res);
 	json_encode_bool("grid_snap", g_config->grid_snap);
+	json_encode_bool("auto_run_scripts", g_config->auto_run_scripts);
 	json_encode_bool("experimental", g_config->experimental);
 	json_encode_i32("neural_res", g_config->neural_res);
-	json_encode_i32("render_mode", g_config->render_mode);
-	json_encode_i32("workspace", g_config->workspace);
-	json_encode_i32("workflow", g_config->workflow);
+	json_encode_i32("console_model", g_config->console_model);
+	json_encode_i32("tools", g_config->tools);
 	json_encode_bool("view2d_grid_show", g_config->view2d_grid_show);
 	json_encode_i32("view2d_grid_cell", g_config->view2d_grid_cell);
 	json_encode_bool("view2d_grid_snap", g_config->view2d_grid_snap);
+	json_encode_bool("pixel_snap", g_config->pixel_snap);
+	json_encode_bool("large_asset_previews", g_config->large_asset_previews);
+	json_encode_bool("tooltips", g_config->tooltips);
 	char *config_json = json_encode_end();
 
 	buffer_t *buffer = sys_string_to_buffer(config_json);
 	iron_file_save_bytes(path, buffer, 0);
+	array_free(buffer);
+	free(buffer);
+	free(config_json);
+}
+
+config_t *config_create_default() {
+	config_t *c           = ALLOC_INIT(config_t, {0});
+	c->version            = string_copy(manifest_version_config);
+	c->sha                = string_copy(config_get_sha());
+	c->locale             = "en"; // "system";
+	c->window_mode        = 0;
+	c->window_resizable   = true;
+	c->window_minimizable = true;
+	c->window_maximizable = true;
+	c->window_w           = 1720;
+	c->window_h           = 960;
+#ifdef IRON_MACOS
+	c->window_w *= iron_display_backing_scale();
+	c->window_h *= iron_display_backing_scale();
+#endif
+	c->window_x     = -1;
+	c->window_y     = -1;
+	c->window_scale = 1.0;
+	if (sys_display_width() >= 2560 && sys_display_height() >= 1600) {
+		c->window_scale = 2.0;
+	}
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	c->window_scale = 2.0;
+#endif
+#ifdef IRON_MACOS
+	c->window_scale = iron_display_backing_scale();
+#endif
+#ifdef IRON_WASM
+	c->window_scale = sys_display_ppi() / 96.0;
+	if (c->window_scale < 1.0) {
+		c->window_scale = 1.0;
+	}
+#endif
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	if (sys_display_ppi() > 330) {
+		c->window_scale = 2.5;
+	}
+	if (sys_display_ppi() > 400) {
+		c->window_scale = 3.0;
+	}
+#endif
+	c->window_vsync     = true;
+	c->window_frequency = sys_display_frequency();
+	c->rp_bloom         = 0.0;
+	c->rp_vignette      = 1.0;
+	c->rp_grain         = 0.09;
+	c->rp_contrast      = 1.0;
+	c->rp_gamma         = 1.0;
+	c->lut_path         = "";
+	c->texture_filter   = true;
+	c->rp_ssao          = 1.0;
+	c->rp_supersample   = 1.0;
+#ifdef IRON_ANDROID
+	if (sys_display_width() >= 3200 && sys_display_height() >= 2136) {
+		c->window_scale   = 2.5;
+		c->rp_supersample = 0.5;
+	}
+#endif
+	c->recent_projects = any_array_create_from_raw((void *[]){}, 0);
+	c->bookmarks       = any_array_create_from_raw((void *[]){}, 0);
+	c->plugins         = any_array_create_from_raw((void *[]){}, 0);
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	c->keymap = "touch.json";
+#else
+	c->keymap = "default.json";
+#endif
+	c->theme  = "default.json";
+	c->server = "https://cloud.armory3d.com";
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	c->undo_steps = 4;
+#else
+	c->undo_steps = 6;
+#endif
+	c->pressure_radius      = true;
+	c->pressure_sensitivity = 2.0;
+	c->camera_fov           = 0.69;
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	c->camera_zoom_speed     = 0.5;
+	c->camera_pan_speed      = 0.5;
+	c->camera_rotation_speed = 0.5;
+#else
+	c->camera_zoom_speed     = 1.0;
+	c->camera_pan_speed      = 1.0;
+	c->camera_rotation_speed = 1.0;
+#endif
+	c->camera_upside_down = false;
+	c->zoom_direction     = ZOOM_DIRECTION_VERTICAL;
+	c->wrap_mouse         = false;
+	c->camera_pivot       = CAMERA_PIVOT_CENTER;
+	c->camera_controls    = CAMERA_CONTROLS_ORBIT;
+	c->layer_res          = TEXTURE_RES_RES2048;
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	c->touch_ui      = true;
+	c->header_pinned = false;
+	c->splash_screen = true;
+#else
+	c->touch_ui      = false;
+	c->header_pinned = true;
+	c->splash_screen = false;
+#endif
+	c->node_previews     = false;
+	c->pressure_hardness = false;
+	c->pressure_angle    = false;
+	c->pressure_opacity  = false;
+#if defined(IRON_ANDROID) || defined(IRON_IOS) || defined(IRON_MACOS)
+	c->material_live = false;
+#else
+	c->material_live = true;
+#endif
+	c->brush_depth_reject  = true;
+	c->brush_angle_reject  = true;
+	c->brush_alpha_discard = 0.1;
+	c->brush_live          = false;
+	c->show_asset_names    = false;
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	c->material_params = false;
+	c->brush_params    = false;
+#else
+	c->material_params = true;
+	c->brush_params    = true;
+#endif
+	c->mesh_params      = false;
+	c->dilate_radius    = 2;
+	c->blender          = "";
+	c->pathtrace_mode   = PATHTRACE_MODE_FAST;
+	c->pathtrace_frames = 8;
+	c->grid_snap        = false;
+	c->view2d_grid_show = false;
+	c->view2d_grid_cell = 64;
+	c->view2d_grid_snap = false;
+	c->pixel_snap       = false;
+#if defined(IRON_ANDROID) || defined(IRON_IOS)
+	c->large_asset_previews = false;
+	c->tooltips             = false;
+#else
+	c->large_asset_previews = true;
+	c->tooltips             = true;
+#endif
+#ifdef NDEBUG
+	c->auto_run_scripts = false;
+#else
+	c->auto_run_scripts = true;
+#endif
+	c->experimental  = false;
+	c->neural_res    = 512;
+	c->console_model = CONSOLE_MODEL_QWEN;
+	c->tools         = TOOLS_PAINT;
+	return c;
 }
 
 void config_init() {
 	if (!config_loaded || g_config == NULL) {
-		gc_unroot(g_config);
-		g_config = GC_ALLOC_INIT(config_t, {0});
-		gc_root(g_config);
-		g_config->version            = string_copy(manifest_version_config);
-		g_config->sha                = string_copy(config_get_sha());
-		g_config->locale             = "en"; // "system";
-		g_config->window_mode        = 0;
-		g_config->window_resizable   = true;
-		g_config->window_minimizable = true;
-		g_config->window_maximizable = true;
-		g_config->window_w           = 1720;
-		g_config->window_h           = 960;
-#ifdef IRON_MACOS
-		g_config->window_w *= 2;
-		g_config->window_h *= 2;
-#endif
-		g_config->window_x     = -1;
-		g_config->window_y     = -1;
-		g_config->window_scale = 1.0;
-		if (sys_display_width() >= 2560 && sys_display_height() >= 1600) {
-			g_config->window_scale = 2.0;
-		}
-#if defined(IRON_ANDROID) || defined(IRON_IOS) || defined(IRON_MACOS)
-		g_config->window_scale = 2.0;
-#endif
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		if (sys_display_ppi() > 330) {
-			g_config->window_scale = 2.5;
-		}
-		if (sys_display_ppi() > 400) {
-			g_config->window_scale = 3.0;
-		}
-#endif
-		g_config->window_vsync     = true;
-		g_config->window_frequency = sys_display_frequency();
-		g_config->rp_bloom         = 0.0;
-		g_config->rp_vignette      = 0.2;
-		g_config->rp_grain         = 0.09;
-		g_config->rp_contrast      = 1.0;
-		g_config->rp_gamma         = 1.0;
-		g_config->lut_path         = "";
-		g_config->texture_filter   = true;
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		g_config->rp_ssao = false;
-#else
-		g_config->rp_ssao = true;
-#endif
-		g_config->rp_supersample = 1.0;
-#ifdef IRON_ANDROID
-		if (sys_display_width() >= 3200 && sys_display_height() >= 2136) {
-			g_config->window_scale   = 2.5;
-			g_config->rp_supersample = 0.5;
-		}
-#endif
-		g_config->recent_projects = any_array_create_from_raw((void *[]){}, 0);
-		g_config->bookmarks       = any_array_create_from_raw((void *[]){}, 0);
-		g_config->plugins         = any_array_create_from_raw((void *[]){}, 0);
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		g_config->keymap = "touch.json";
-#else
-		g_config->keymap = "default.json";
-#endif
-		g_config->theme  = "default.json";
-		g_config->server = "https://cloud.armory3d.com";
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		g_config->undo_steps = 4;
-#else
-		g_config->undo_steps = 6;
-#endif
-		g_config->pressure_radius      = true;
-		g_config->pressure_sensitivity = 2.0;
-		g_config->camera_fov           = 0.69;
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		g_config->camera_zoom_speed     = 0.5;
-		g_config->camera_pan_speed      = 0.5;
-		g_config->camera_rotation_speed = 0.5;
-#else
-		g_config->camera_zoom_speed     = 1.0;
-		g_config->camera_pan_speed      = 1.0;
-		g_config->camera_rotation_speed = 1.0;
-#endif
-		g_config->camera_upside_down = false;
-		g_config->zoom_direction     = ZOOM_DIRECTION_VERTICAL;
-		g_config->wrap_mouse         = false;
-		g_config->camera_pivot       = CAMERA_PIVOT_CENTER;
-		g_config->camera_controls    = CAMERA_CONTROLS_ORBIT;
-		g_config->layer_res          = TEXTURE_RES_RES2048;
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		g_config->touch_ui      = true;
-		g_config->splash_screen = true;
-#else
-		g_config->touch_ui      = false;
-		g_config->splash_screen = false;
-#endif
-		g_config->node_previews     = false;
-		g_config->pressure_hardness = false;
-		g_config->pressure_angle    = false;
-		g_config->pressure_opacity  = false;
-#if defined(IRON_ANDROID) || defined(IRON_IOS) || defined(IRON_MACOS)
-		g_config->material_live = false;
-#else
-		g_config->material_live = true;
-#endif
-		g_config->brush_depth_reject  = true;
-		g_config->brush_angle_reject  = true;
-		g_config->brush_alpha_discard = 0.1;
-		g_config->brush_live          = false;
-		g_config->show_asset_names    = false;
-		g_config->dilate_radius       = 2;
-		g_config->blender             = "";
-		g_config->scene_atlas_res     = TEXTURE_RES_RES8192;
-		g_config->pathtrace_mode      = PATHTRACE_MODE_FAST;
-		g_config->grid_snap           = false;
-		g_config->view2d_grid_show    = false;
-		g_config->view2d_grid_cell    = 64;
-		g_config->view2d_grid_snap    = false;
-		g_config->experimental        = false;
-		g_config->neural_res          = 512;
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		g_config->render_mode = RENDER_MODE_FORWARD;
-#else
-		g_config->render_mode = RENDER_MODE_DEFERRED;
-#endif
-		g_config->workspace = WORKSPACE_PAINT_3D;
-		g_config->workflow  = WORKFLOW_PBR;
+		g_config = config_create_default();
 	}
 	else {
-		// Discard old config
-		if (!string_equals(g_config->sha, config_get_sha())) {
-			config_loaded = false;
-			config_init();
-			return;
-		}
+		g_config->sha = string_copy(config_get_sha());
 	}
 
 	ui_touch_control = g_config->touch_ui;
+	ui_tooltips      = g_config->tooltips;
 	ui_touch_speed   = 1.0;
 #if defined(IRON_ANDROID) || defined(IRON_IOS)
 	if (sys_display_ppi() > 400) {
 		ui_touch_speed = 0.5;
 	}
 #endif
-	base_res_handle->i = g_config->layer_res;
+	base_res = g_config->layer_res;
 	config_set_texture_res(g_config->layer_res);
 	keymap_load();
 }
 
-void config_init_layout() {
-	config_t    *raw        = g_config;
-	bool         show2d     = (ui_nodes_show || ui_view2d_show) && raw->layout != NULL;
-	i32_array_t *new_layout = i32_array_create_from_raw((i32[]){}, 0);
+config_t *config_from_map_to_config(any_map_t *old) {
+	config_t *c              = ALLOC_INIT(config_t, {0});
+	c->version               = string_copy(manifest_version_config);
+	c->sha                   = string_copy(config_get_sha());
+	c->locale                = string_copy(any_map_get(old, "locale"));
+	c->window_mode           = armpack_map_get_i32(old, "window_mode");
+	c->window_w              = armpack_map_get_i32(old, "window_w");
+	c->window_h              = armpack_map_get_i32(old, "window_h");
+	c->window_x              = armpack_map_get_i32(old, "window_x");
+	c->window_y              = armpack_map_get_i32(old, "window_y");
+	c->window_resizable      = armpack_map_get_i32(old, "window_resizable") > 0;
+	c->window_maximizable    = armpack_map_get_i32(old, "window_maximizable") > 0;
+	c->window_minimizable    = armpack_map_get_i32(old, "window_minimizable") > 0;
+	c->window_vsync          = armpack_map_get_i32(old, "window_vsync") > 0;
+	c->window_frequency      = armpack_map_get_i32(old, "window_frequency");
+	c->window_scale          = armpack_map_get_f32(old, "window_scale");
+	c->rp_supersample        = armpack_map_get_f32(old, "rp_supersample");
+	c->rp_ssao               = armpack_map_get_f32(old, "rp_ssao");
+	c->rp_bloom              = armpack_map_get_f32(old, "rp_bloom");
+	c->rp_vignette           = armpack_map_get_f32(old, "rp_vignette");
+	c->rp_grain              = armpack_map_get_f32(old, "rp_grain");
+	c->rp_contrast           = armpack_map_get_f32(old, "rp_contrast");
+	c->rp_gamma              = armpack_map_get_f32(old, "rp_gamma");
+	c->lut_path              = string_copy(any_map_get(old, "lut_path"));
+	c->texture_filter        = armpack_map_get_i32(old, "texture_filter") > 0;
+	c->recent_projects       = any_map_get(old, "recent_projects");
+	c->bookmarks             = any_map_get(old, "bookmarks");
+	c->plugins               = any_map_get(old, "plugins");
+	c->keymap                = string_copy(any_map_get(old, "keymap"));
+	c->theme                 = string_copy(any_map_get(old, "theme"));
+	c->undo_steps            = armpack_map_get_i32(old, "undo_steps");
+	c->camera_fov            = armpack_map_get_f32(old, "camera_fov");
+	c->camera_pan_speed      = armpack_map_get_f32(old, "camera_pan_speed");
+	c->camera_zoom_speed     = armpack_map_get_f32(old, "camera_zoom_speed");
+	c->camera_rotation_speed = armpack_map_get_f32(old, "camera_rotation_speed");
+	c->camera_upside_down    = armpack_map_get_i32(old, "camera_upside_down") > 0;
+	c->zoom_direction        = armpack_map_get_i32(old, "zoom_direction");
+	c->wrap_mouse            = armpack_map_get_i32(old, "wrap_mouse") > 0;
+	c->show_asset_names      = armpack_map_get_i32(old, "show_asset_names") > 0;
+	c->material_params       = armpack_map_get_i32(old, "material_params") > 0;
+	c->brush_params          = armpack_map_get_i32(old, "brush_params") > 0;
+	c->mesh_params           = armpack_map_get_i32(old, "mesh_params") > 0;
+	c->touch_ui              = armpack_map_get_i32(old, "touch_ui") > 0;
+	c->splash_screen         = armpack_map_get_i32(old, "splash_screen") > 0;
+	c->header_pinned         = armpack_map_get_i32(old, "header_pinned") > 0;
+	c->layout_tabs           = any_map_get(old, "layout_tabs");
+	c->camera_pivot          = armpack_map_get_i32(old, "camera_pivot");
+	c->camera_controls       = armpack_map_get_i32(old, "camera_controls");
+	c->server                = string_copy(any_map_get(old, "server"));
+	c->viewport_mode         = armpack_map_get_i32(old, "viewport_mode");
+	c->pathtrace_mode        = armpack_map_get_i32(old, "pathtrace_mode");
+	c->pathtrace_frames      = armpack_map_get_i32(old, "pathtrace_frames");
+	c->pressure_radius       = armpack_map_get_i32(old, "pressure_radius") > 0;
+	c->pressure_sensitivity  = armpack_map_get_f32(old, "pressure_sensitivity");
+	c->layer_res             = armpack_map_get_i32(old, "layer_res");
+	c->brush_live            = armpack_map_get_i32(old, "brush_live") > 0;
+	c->node_previews         = armpack_map_get_i32(old, "node_previews") > 0;
+	c->pressure_hardness     = armpack_map_get_i32(old, "pressure_hardness") > 0;
+	c->pressure_angle        = armpack_map_get_i32(old, "pressure_angle") > 0;
+	c->pressure_opacity      = armpack_map_get_i32(old, "pressure_opacity") > 0;
+	c->material_live         = armpack_map_get_i32(old, "material_live") > 0;
+	c->brush_depth_reject    = armpack_map_get_i32(old, "brush_depth_reject") > 0;
+	c->brush_angle_reject    = armpack_map_get_i32(old, "brush_angle_reject") > 0;
+	c->brush_alpha_discard   = armpack_map_get_f32(old, "brush_alpha_discard");
+	c->dilate_radius         = armpack_map_get_i32(old, "dilate_radius");
+	c->blender               = string_copy(any_map_get(old, "blender"));
+	c->grid_snap             = armpack_map_get_i32(old, "grid_snap") > 0;
+	c->auto_run_scripts      = armpack_map_get_i32(old, "auto_run_scripts") > 0;
+	c->experimental          = armpack_map_get_i32(old, "experimental") > 0;
+	c->neural_res            = armpack_map_get_i32(old, "neural_res");
+	c->console_model         = armpack_map_get_i32(old, "console_model");
+	c->tools                 = armpack_map_get_i32(old, "tools");
+	c->view2d_grid_show      = armpack_map_get_i32(old, "view2d_grid_show") > 0;
+	c->view2d_grid_cell      = armpack_map_get_i32(old, "view2d_grid_cell");
+	c->view2d_grid_snap      = armpack_map_get_i32(old, "view2d_grid_snap") > 0;
+	c->pixel_snap            = armpack_map_get_i32(old, "pixel_snap") > 0;
+	c->large_asset_previews  = armpack_map_get_i32(old, "large_asset_previews") > 0;
+	c->tooltips              = armpack_map_get_i32(old, "tooltips") > 0;
+	return c;
+}
 
-	i32_array_push(new_layout, math_floor(ui_sidebar_default_w * raw->window_scale)); // LayoutSidebarW
-	i32_array_push(new_layout, math_floor(iron_window_height() / 2.0));               // LayoutSidebarH0
-	i32_array_push(new_layout, math_floor(iron_window_height() / 2.0));               // LayoutSidebarH1
+config_t *config_from_version_3(any_map_t *old) {
+	config_t *def = config_create_default();
+	armpack_map_set_i32(old, "tooltips", def->tooltips);
+	return config_from_map_to_config(old);
+}
 
-#ifdef IRON_IOS
-	i32_array_push(new_layout, show2d ? math_floor((sys_w() + raw->layout->buffer[LAYOUT_SIZE_NODES_W]) * 0.473) : math_floor(sys_w() * 0.473)); // LayoutNodesW
-#elif defined(IRON_ANDROID)
-	i32_array_push(new_layout, show2d ? math_floor((sys_w() + raw->layout->buffer[LAYOUT_SIZE_NODES_W]) * 0.473) : math_floor(sys_w() * 0.473));
-#else
-	i32_array_push(new_layout,
-	               show2d ? math_floor((sys_w() + raw->layout->buffer[LAYOUT_SIZE_NODES_W]) * 0.515)
-	                      : math_floor(sys_w() * 0.515)); // Align with ui header controls
-#endif
+config_t *config_from_version_2(any_map_t *old) {
+	config_t *def = config_create_default();
+	armpack_map_set_i32(old, "large_asset_previews", def->large_asset_previews);
+	return config_from_version_3(old);
+}
 
-	i32_array_push(new_layout, math_floor(sys_h() / 2.0));                              // LayoutNodesH
-	i32_array_push(new_layout, math_floor(ui_statusbar_default_h * raw->window_scale)); // LayoutStatusH
+config_t *config_from_version_1(any_map_t *old) {
+	config_t *def = config_create_default();
+	armpack_map_set_i32(old, "material_params", def->material_params);
+	armpack_map_set_i32(old, "brush_params", def->brush_params);
+	armpack_map_set_i32(old, "mesh_params", def->mesh_params);
+	armpack_map_set_i32(old, "header_pinned", def->header_pinned);
+	armpack_map_set_i32(old, "auto_run_scripts", def->auto_run_scripts);
+	armpack_map_set_i32(old, "tools", def->tools);
+	armpack_map_set_i32(old, "pixel_snap", def->pixel_snap);
+	any_map_set(old, "layout_tabs", def->layout_tabs);
+	armpack_map_set_f32(old, "rp_vignette", def->rp_vignette);
+	armpack_map_set_i32(old, "viewport_mode", def->viewport_mode);
+	armpack_map_set_i32(old, "pathtrace_mode", def->pathtrace_mode);
+	return config_from_version_2(old);
+}
 
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-	i32_array_push(new_layout, 0); // LayoutHeader
-#else
-	i32_array_push(new_layout, 1);
-#endif
+static bool config_is_version(char *s, char *version) {
+	char *prefix = string("{\"version\":\"%s\"", version);
+	bool  r      = starts_with(s, prefix);
+	free(prefix);
+	return r;
+}
 
-	raw->layout_tabs = i32_array_create_from_raw(
-	    (i32[]){
-	        0,
-	        0,
-	        0,
-	    },
-	    3);
+config_t *config_from_old(char *s) {
+	config_t *(*fns[])(any_map_t *) = {
+	    config_from_version_1,
+	    config_from_version_2,
+	    config_from_version_3,
+	};
+	for (i32 v = sizeof(fns) / sizeof(fns[0]) - 1; v >= 0; --v) {
+		if (config_is_version(s, i32_to_string(v + 1))) {
+			buffer_t *b = json_encode_to_armpack(s);
+			return b != NULL ? fns[v](armpack_decode_to_map(b)) : NULL;
+		}
+	}
+	return NULL;
+}
 
-	raw->layout = new_layout;
+config_t *config_from_json(char *s) {
+	if (config_is_version(s, manifest_version_config)) {
+		return json_parse(s);
+	}
+	return config_from_old(s);
 }
 
 char *config_get_sha() {
@@ -361,45 +489,35 @@ iron_window_options_t *config_get_options() {
 		features |= IRON_WINDOW_FEATURES_MINIMIZABLE;
 	}
 	char                  *title = string("untitled - %s", manifest_title);
-	iron_window_options_t *ops   = GC_ALLOC_INIT(iron_window_options_t, {.title     = title,
-	                                                                     .width     = g_config->window_w,
-	                                                                     .height    = g_config->window_h,
-	                                                                     .x         = g_config->window_x,
-	                                                                     .y         = g_config->window_y,
-	                                                                     .mode      = window_mode,
-	                                                                     .features  = features,
-	                                                                     .vsync     = g_config->window_vsync,
-	                                                                     .frequency = g_config->window_frequency});
+	iron_window_options_t *ops   = ALLOC_INIT(iron_window_options_t, {.title     = title,
+	                                                                  .width     = g_config->window_w,
+	                                                                  .height    = g_config->window_h,
+	                                                                  .x         = g_config->window_x,
+	                                                                  .y         = g_config->window_y,
+	                                                                  .mode      = window_mode,
+	                                                                  .features  = features,
+	                                                                  .vsync     = g_config->window_vsync,
+	                                                                  .frequency = g_config->window_frequency});
 	return ops;
 }
 
 void config_restore() {
-	gc_unroot(ui_children);
-	ui_children = any_map_create(); // Reset ui handles
-	gc_root(ui_children);
-	config_loaded        = false;
-	i32_array_t *_layout = g_config->layout;
+	config_loaded = false;
 	config_init();
-	g_config->layout = _layout;
-	config_init_layout();
+	ui_dock_reset();
 	translator_load_translations(g_config->locale);
 	config_apply();
 	config_load_theme(g_config->theme, true);
 }
 
 void config_import_from(config_t *from) {
-	char *_sha     = g_config->sha;
-	char *_version = g_config->version;
-	gc_unroot(g_config);
-	g_config = from;
-	gc_root(g_config);
+	char *_sha        = g_config->sha;
+	char *_version    = g_config->version;
+	g_config          = from;
 	g_config->sha     = string_copy(_sha);
 	g_config->version = string_copy(_version);
-	gc_unroot(ui_children);
-	ui_children = any_map_create(); // Reset ui handles
-	gc_root(ui_children);
 	keymap_load();
-	config_init_layout();
+	base_set_workspace(WORKSPACE_PRESET_NONE);
 	translator_load_translations(g_config->locale);
 	config_apply();
 	config_load_theme(g_config->theme, true);
@@ -407,6 +525,7 @@ void config_import_from(config_t *from) {
 
 void config_apply() {
 	config_save();
+	ui_tooltips            = g_config->tooltips;
 	g_context->ddirty      = 2;
 	gpu_texture_t *current = _draw_current;
 	bool           in_use  = gpu_in_use;
@@ -434,25 +553,20 @@ i32 config_get_layer_res() {
 	return config_texture_res_size(res);
 }
 
-i32 config_get_scene_atlas_res() {
-	i32 res = g_config->scene_atlas_res;
-	return config_texture_res_size(res);
-}
-
 void config_set_texture_res(i32 pos) {
 	if (pos != TEXTURE_RES_CUSTOM) {
-		f32 res              = (f32)config_texture_res_size(pos);
-		base_res_x_handle->f = res;
-		base_res_y_handle->f = res;
+		f32 res    = (f32)config_texture_res_size(pos);
+		base_res_x = res;
+		base_res_y = res;
 	}
 }
 
 i32 config_get_texture_res_x() {
-	return (i32)base_res_x_handle->f;
+	return (i32)base_res_x;
 }
 
 i32 config_get_texture_res_y() {
-	return (i32)base_res_y_handle->f;
+	return (i32)base_res_y;
 }
 
 i32 config_get_texture_res_pos(i32 i) {
@@ -464,16 +578,12 @@ i32 config_get_texture_res_pos(i32 i) {
 }
 
 void config_load_theme(char *theme, bool tag_redraw) {
-	gc_unroot(g_theme);
 	g_theme = ui_theme_create();
-	gc_root(g_theme);
 
 	if (!string_equals(theme, "default.json")) {
 		buffer_t   *b      = data_get_blob(string("themes/%s", theme));
 		ui_theme_t *parsed = json_parse(sys_buffer_to_string(b));
-		gc_unroot(g_theme);
-		g_theme = parsed;
-		gc_root(g_theme);
+		g_theme            = parsed;
 	}
 
 	if (tag_redraw) {
@@ -515,3 +625,7 @@ bool config_is_iphone() {
 	return sys_display_ppi() > 330;
 }
 #endif
+
+bool config_is_raytrace_fast() {
+	return g_config->pathtrace_mode == PATHTRACE_MODE_FAST;
+}

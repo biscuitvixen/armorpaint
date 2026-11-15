@@ -37,15 +37,15 @@ void brush_output_node_parse_inputs() {
 
 	logic_node_value_t *opac = input4; // Float or texture name
 	if (opac == NULL) {
-		opac = GC_ALLOC_INIT(logic_node_value_t, {._f32 = 1.0});
+		opac = TMP_ALLOC_INIT(logic_node_value_t, {._f32 = 1.0});
 	}
 	if (opac->_str != NULL) { // string
 		g_context->brush_mask_image_is_alpha = ends_with(opac->_str, ".a");
-		opac->_str                           = string_copy(substring(opac->_str, 0, string_last_index_of(opac->_str, ".")));
+		opac->_str                           = string_tmp("%.*s", string_last_index_of(opac->_str, "."), opac->_str);
 		g_context->brush_nodes_opacity       = 1.0;
 		i32 index                            = -1;
 		for (i32 i = 0; i < g_project->_->assets->length; ++i) {
-			if (string_equals(g_project->_->assets->buffer[i]->name, opac->_str)) {
+			if (string_equals(g_project->_->assets->buffer[i]->file, opac->_str)) {
 				index = i;
 				break;
 			}
@@ -56,7 +56,7 @@ void brush_output_node_parse_inputs() {
 		}
 	}
 	else {
-		g_context->brush_nodes_opacity = opac->_f32;
+		g_context->brush_nodes_opacity = math_max(0.0, math_min(1.0, opac->_f32));
 		g_context->brush_mask_image    = NULL;
 	}
 
@@ -64,14 +64,14 @@ void brush_output_node_parse_inputs() {
 
 	logic_node_value_t *stencil = input6; // Float or texture name
 	if (stencil == NULL) {
-		stencil = GC_ALLOC_INIT(logic_node_value_t, {._f32 = 1.0});
+		stencil = TMP_ALLOC_INIT(logic_node_value_t, {._f32 = 1.0});
 	}
 	if (stencil->_str != NULL) { // string
 		g_context->brush_stencil_image_is_alpha = ends_with(stencil->_str, ".a");
-		stencil->_str                           = string_copy(substring(stencil->_str, 0, string_last_index_of(stencil->_str, ".")));
+		stencil->_str                           = string_tmp("%.*s", string_last_index_of(stencil->_str, "."), stencil->_str);
 		i32 index                               = -1;
 		for (i32 i = 0; i < g_project->_->assets->length; ++i) {
-			if (string_equals(g_project->_->assets->buffer[i]->name, stencil->_str)) {
+			if (string_equals(g_project->_->assets->buffer[i]->file, stencil->_str)) {
 				index = i;
 				break;
 			}
@@ -98,20 +98,15 @@ void brush_output_node_run() {
 	f32 top    = 0.0;
 	f32 bottom = 1.0;
 
-	if (g_context->paint2d) {
-		left  = 1.0;
-		right = (g_context->split_view ? 2.0 : 1.0) + ui_view2d_ww / (float)base_w();
-	}
-
-	// Do not paint over floating toolbar
-	if (context_is_floating_toolbar()) {
+	// Do not paint over floating toolbar, it floats in the 2D view when there is no 3D view
+	if (context_is_floating_toolbar() && base_paint_in_2d() == !base_view3d_show) {
 		i32 w = ui_toolbar_x() + ui_toolbar_w(false);
-		left += w / (float)sys_w();
-		top += w / (float)sys_h();
+		left += w / (float)base_paint_view_w();
+		top += w / (float)base_paint_view_h();
 
 #ifdef IRON_IOS
 		if (config_is_iphone()) {
-			top += w / (float)sys_h();
+			top += w / (float)base_paint_view_h();
 		}
 #endif
 	}
@@ -127,14 +122,20 @@ void brush_output_node_run() {
 		return;
 	}
 
+	if (args_player) {
+		return;
+	}
+
+	bool picking_object = g_context->tool == TOOL_TYPE_CURSOR;
+
 	// Do not paint over fill layer
-	if (g_context->layer->fill_material != NULL && g_context->tool != TOOL_TYPE_PICKER && g_context->tool != TOOL_TYPE_MATERIAL &&
+	if (!picking_object && g_context->layer->fill_material != NULL && g_context->tool != TOOL_TYPE_PICKER && g_context->tool != TOOL_TYPE_MATERIAL &&
 	    g_context->tool != TOOL_TYPE_COLORID) {
 		return;
 	}
 
 	// Do not paint over groups
-	if (slot_layer_is_group(g_context->layer)) {
+	if (!picking_object && slot_layer_is_group(g_context->layer)) {
 		return;
 	}
 
@@ -142,11 +143,11 @@ void brush_output_node_run() {
 		return;
 	}
 
-	if (!slot_layer_is_visible(g_context->layer) && !g_context->paint2d) {
+	if (!picking_object && !slot_layer_is_visible(g_context->layer) && !g_context->paint2d) {
 		return;
 	}
 
-	if (g_ui->is_hovered || base_is_dragging || base_is_resizing || g_ui->is_scrolling || g_ui->combo_selected_handle != NULL) {
+	if (g_ui->is_hovered || base_is_dragging || base_is_resizing || ui_dock_is_dragging() || g_ui->is_scrolling || g_ui->combo_selected_id != 0) {
 		return;
 	}
 
@@ -160,12 +161,12 @@ void brush_output_node_run() {
 	}
 
 	// Path layer - add path points only
-	if (slot_layer_is_path(g_context->layer) && !started) {
+	if (!picking_object && slot_layer_is_path(g_context->layer) && !started) {
 		return;
 	}
 
 	// Path layer - dragging existing path point
-	if (slot_layer_is_path(g_context->layer) && util_layer_is_path_point_dragging()) {
+	if (!picking_object && slot_layer_is_path(g_context->layer) && util_layer_is_path_point_dragging()) {
 		return;
 	}
 
@@ -190,24 +191,32 @@ void brush_output_node_run() {
 	}
 
 	// Path layer - add point and repaint
-	if (slot_layer_is_path(g_context->layer)) {
+	if (!picking_object && slot_layer_is_path(g_context->layer)) {
 		util_layer_add_path_point(g_context->layer, g_context->paint_vec.x, g_context->paint_vec.y);
 		return;
 	}
 
 	if (g_context->painted <= 1) {
 		g_context->pdirty = 1;
-		g_context->rdirty = 2;
-		sculpt_push_undo  = true;
+		slot_layer_t *l   = g_context->layer;
+		if (l->texpaint_sculpt != NULL || (l->parent != NULL && l->parent->texpaint_sculpt != NULL)) {
+			g_context->ddirty = 2;
+		}
+		sculpt_push_undo = true;
 	}
 }
 
 void *brush_output_node_create(ui_node_t *raw, f32_array_t *args) {
-	brush_output_node_t *n = GC_ALLOC_INIT(brush_output_node_t, {0});
+	brush_output_node_t *n = ALLOC_INIT(brush_output_node_t, {0});
 	n->base                = logic_node_create(n);
 	n->raw                 = raw;
 	brush_output_node_inst = n;
 	return n;
+}
+
+void brush_output_node_init() {
+	// any_array_push(nodes_brush_category0, brush_output_node_def);
+	any_map_set(nodes_brush_creates, "brush_output_node", brush_output_node_create);
 }
 
 // let brush_output_node_def: node_t = {

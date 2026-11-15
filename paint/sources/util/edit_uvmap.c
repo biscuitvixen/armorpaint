@@ -19,21 +19,8 @@ static bool _is_selected(i32 idx) {
 }
 
 static void _get_tex_transform(f32 *out_tx, f32 *out_ty, f32 *out_tw, f32 *out_th) {
-	i32 headerh = g_config->layout->buffer[LAYOUT_SIZE_HEADER] == 1 ? ui_header_h * 2 : ui_header_h;
-	i32 apph    = iron_window_height() - g_config->layout->buffer[LAYOUT_SIZE_STATUS_H] + headerh;
-	if (!base_view3d_show) {
-		apph = base_h();
-	}
-	f32 wm = fmin(ui_view2d_ww, ui_view2d_wh);
-	f32 tw = wm * 0.9f * ui_view2d_pan_scale;
-	f32 th = tw;
-	if (util_uv_uvmap != NULL) {
-		th = tw * (util_uv_uvmap->height / (f32)util_uv_uvmap->width);
-	}
-	*out_tw = tw;
-	*out_th = th;
-	*out_tx = ui_view2d_ww / 2.0f - tw / 2.0f + ui_view2d_pan_x;
-	*out_ty = apph / 2.0f - th / 2.0f + ui_view2d_pan_y;
+	f32 aspect = util_uv_uvmap != NULL ? util_uv_uvmap->height / (f32)util_uv_uvmap->width : 1.0f;
+	ui_view2d_tex_rect(aspect, out_tx, out_ty, out_tw, out_th);
 }
 
 void edit_uvmap_update() {
@@ -42,8 +29,7 @@ void edit_uvmap_update() {
 	}
 
 	if (_selected_verts == NULL) {
-		_selected_verts = i32_array_create_from_raw((i32[]){0}, 1);
-		gc_root(_selected_verts);
+		_selected_verts         = i32_array_create_from_raw((i32[]){0}, 1);
 		_selected_verts->length = 0;
 	}
 
@@ -104,7 +90,6 @@ void edit_uvmap_update() {
 			texa->buffer[vi * 2]     = (i16)math_min(math_max(new_x, -32767), 32767);
 			texa->buffer[vi * 2 + 1] = (i16)math_min(math_max(new_y, -32767), 32767);
 		}
-		util_uv_uvmap_cached    = false;
 		ui_view2d_hwnd->redraws = 2;
 	}
 
@@ -119,8 +104,15 @@ void edit_uvmap_update() {
 			_is_dragging     = false;
 			mesh_object_t *o = g_context->paint_object;
 			mesh_data_build_vertices(o->data->_->vertex_buffer, o->data->vertex_arrays);
+
+			if (g_context->merged_object != NULL) {
+				util_mesh_merge(util_mesh_get_visible());
+			}
 			util_uv_uvmap_cached       = false;
 			util_uv_trianglemap_cached = false;
+			util_uv_seammap_cached     = false;
+			util_uv_dilatemap_cached   = false;
+			ui_view2d_hwnd->redraws    = 2;
 		}
 		if (_is_box_sel) {
 			_is_box_sel             = false;

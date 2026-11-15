@@ -454,6 +454,10 @@ LRESULT WINAPI IronWindowsMessageProcedure(HWND hWnd, UINT msg, WPARAM wParam, L
 		else {
 			iron_internal_mouse_window_deactivated();
 			iron_internal_background_callback();
+			for (int i = 0; i < 256; ++i) {
+				keyPressed[i] = false;
+			}
+			controlDown = false;
 #ifdef HANDLE_ALT_ENTER
 			altDown = false;
 #endif
@@ -623,27 +627,11 @@ LRESULT WINAPI IronWindowsMessageProcedure(HWND hWnd, UINT msg, WPARAM wParam, L
 #endif
 			else {
 				if (controlDown && keyTranslated[wParam] == KEY_CODE_X) {
-					char *text = iron_internal_cut_callback();
-					if (text != NULL) {
-						wchar_t wtext[4096];
-						MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, 4096);
-						OpenClipboard(hWnd);
-						EmptyClipboard();
-						size_t size   = (wcslen(wtext) + 1) * sizeof(wchar_t);
-						HANDLE handle = GlobalAlloc(GMEM_MOVEABLE, size);
-						void  *data   = GlobalLock(handle);
-						memcpy(data, wtext, size);
-						GlobalUnlock(handle);
-						SetClipboardData(CF_UNICODETEXT, handle);
-						CloseClipboard();
-					}
+					iron_internal_cut_callback();
 				}
 
 				if (controlDown && keyTranslated[wParam] == KEY_CODE_C) {
-					char *text = iron_internal_copy_callback();
-					if (text != NULL) {
-						iron_copy_to_clipboard(text);
-					}
+					iron_internal_copy_callback();
 				}
 
 				if (controlDown && keyTranslated[wParam] == KEY_CODE_V) {
@@ -1015,26 +1003,28 @@ static DWORD getExStyle(int features) {
 
 int iron_window_x() {
 	RECT rect;
-	GetWindowRect(windows[0].handle, &rect);
-	windows[0].x = rect.left;
+	if (GetWindowRect(windows[0].handle, &rect)) {
+		windows[0].x = rect.left;
+	}
 	return windows[0].x;
 }
 
 int iron_window_y() {
 	RECT rect;
-	GetWindowRect(windows[0].handle, &rect);
-	windows[0].y = rect.top;
+	if (GetWindowRect(windows[0].handle, &rect)) {
+		windows[0].y = rect.top;
+	}
 	return windows[0].y;
 }
 
 int iron_window_width() {
-	RECT rect;
+	RECT rect = {0};
 	GetClientRect(windows[0].handle, &rect);
 	return rect.right;
 }
 
 int iron_window_height() {
-	RECT rect;
+	RECT rect = {0};
 	GetClientRect(windows[0].handle, &rect);
 	return rect.bottom;
 }
@@ -1770,6 +1760,7 @@ volatile int  iron_exec_async_done        = 1;
 char         *iron_exec_async_output_file = NULL;
 static HANDLE child_handle                = NULL;
 static HANDLE wait_handle                 = NULL;
+static HANDLE child_job                   = NULL;
 
 static void CALLBACK exec_wait_callback(PVOID lparam, BOOLEAN b) {
 	iron_exec_async_done = 1;
@@ -1778,15 +1769,30 @@ static void CALLBACK exec_wait_callback(PVOID lparam, BOOLEAN b) {
 void iron_exec_async(const char *path, char *argv[]) {
 	iron_exec_async_done = 0;
 
-	char cmd[4096] = {0};
-	snprintf(cmd, sizeof(cmd), "\"%s\"", path);
-	for (int i = 1; argv[i] != NULL; ++i) {
-		strncat(cmd, " \"", sizeof(cmd) - strlen(cmd) - 1);
-		strncat(cmd, argv[i], sizeof(cmd) - strlen(cmd) - 1);
-		strncat(cmd, "\"", sizeof(cmd) - strlen(cmd) - 1);
+	static char    cmd[32768];
+	static wchar_t wcmd[32768];
+
+	size_t len = 0;
+	for (int i = 0;; ++i) {
+		const char *arg = i == 0 ? path : argv[i];
+		if (arg == NULL) {
+			break;
+		}
+		if (i > 0 && len + 1 < sizeof(cmd)) {
+			cmd[len++] = ' ';
+		}
+		if (len + 1 < sizeof(cmd)) {
+			cmd[len++] = '"';
+		}
+		for (const char *p = arg; *p != '\0' && len + 2 < sizeof(cmd); ++p) {
+			cmd[len++] = *p == '"' ? '\'' : *p;
+		}
+		if (len + 1 < sizeof(cmd)) {
+			cmd[len++] = '"';
+		}
 	}
-	wchar_t wcmd[4096];
-	MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, 4096);
+	cmd[len] = '\0';
+	MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, 32768);
 
 	STARTUPINFOW        si = {0};
 	PROCESS_INFORMATION pi = {0};
@@ -1794,25 +1800,42 @@ void iron_exec_async(const char *path, char *argv[]) {
 	si.dwFlags             = STARTF_USESHOWWINDOW;
 	si.wShowWindow         = SW_HIDE;
 
-	HANDLE out_handle = INVALID_HANDLE_VALUE;
+	SECURITY_ATTRIBUTES sa         = {sizeof(sa), NULL, TRUE};
+	HANDLE              out_handle = INVALID_HANDLE_VALUE;
+	HANDLE              in_handle  = INVALID_HANDLE_VALUE;
 	if (iron_exec_async_output_file != NULL) {
 		wchar_t wpath[1024];
 		MultiByteToWideChar(CP_UTF8, 0, iron_exec_async_output_file, -1, wpath, 1024);
-		SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
-		out_handle             = CreateFileW(wpath, GENERIC_WRITE, 0, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		out_handle = CreateFileW(wpath, GENERIC_WRITE, 0, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		in_handle  = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ, &sa, OPEN_EXISTING, 0, NULL);
 		si.dwFlags |= STARTF_USESTDHANDLES;
+		si.hStdInput  = in_handle;
 		si.hStdOutput = out_handle;
 		si.hStdError  = out_handle;
 	}
 
-	BOOL success = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+	if (child_job == NULL) {
+		child_job                                  = CreateJobObjectW(NULL, NULL);
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit = {0};
+		limit.BasicLimitInformation.LimitFlags     = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		SetInformationJobObject(child_job, JobObjectExtendedLimitInformation, &limit, sizeof(limit));
+	}
+
+	BOOL success = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
 	if (out_handle != INVALID_HANDLE_VALUE) {
 		CloseHandle(out_handle);
+	}
+	if (in_handle != INVALID_HANDLE_VALUE) {
+		CloseHandle(in_handle);
 	}
 	if (!success) {
 		iron_exec_async_done = 1;
 		return;
 	}
+	if (child_job != NULL) {
+		AssignProcessToJobObject(child_job, pi.hProcess);
+	}
+	ResumeThread(pi.hThread);
 	child_handle = pi.hProcess;
 	CloseHandle(pi.hThread);
 	RegisterWaitForSingleObject(&wait_handle, child_handle, exec_wait_callback, NULL, INFINITE, WT_EXECUTEONLYONCE);

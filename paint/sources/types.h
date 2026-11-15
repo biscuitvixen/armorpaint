@@ -1,17 +1,52 @@
 
 #pragma once
+#include "iron_physics.h"
 
 #include "enums.h"
 #include "minic.h"
+#include "minic_tcc.h"
 
 typedef struct slot_brush {
 	struct ui_nodes       *nodes;
 	struct ui_node_canvas *canvas;
-	struct gpu_texture    *image;      // 200px
-	struct gpu_texture    *image_icon; // 50px
+	struct gpu_texture    *image; // 200px
+	struct gpu_texture    *image_icon;
+	struct gpu_texture    *image_wave; // Stroke preview, generated at runtime
 	bool                   preview_ready;
 	i32                    id;
 } slot_brush_t;
+
+typedef struct mesh_nodes {
+	i32                    uid; // Object
+	struct ui_nodes       *nodes;
+	struct ui_node_canvas *canvas;
+	struct mesh_data      *input;  // Original mesh
+	struct mesh_data      *output; // Mesh assigned to the object, equals input unless the nodes change it
+	u32                    hash;
+	bool                   dirty;       // Input replaced, rebuilt once the mouse is up
+	bool                   reads_frame; // A script read the timeline frame, rebuilt when it changes
+	i32                    frame;       // Timeline frame of the last build
+} mesh_nodes_t;
+
+typedef struct mesh_geo {
+	f32 *pos;
+	f32 *nor;
+	f32 *tex;
+	u32 *ind;
+	i32  vertex_count;
+	i32  index_count;
+	i32  vertex_capacity; // Allocated sizes, counts can be lowered
+	i32  index_capacity;
+} mesh_geo_t;
+
+typedef struct mesh_geo_image {
+	i32  width;
+	i32  height;
+	u8  *pixels;  // As stored in the texture, rows from v 0, read with mesh_geo_image_sample
+	i32  format;  // gpu_texture_format_t of the pixels
+	bool bgra;    // 8 bit rgba pixels in bgra order
+	i32  channel; // 0 - 3 reads that channel in all four, -1 rgba
+} mesh_geo_image_t;
 
 typedef struct slot_layer {
 	i32                   id;
@@ -51,6 +86,7 @@ typedef struct slot_layer {
 	i32_array_t          *path_points_parent;
 	i32                   path_tool;
 	bool                  path_curved;
+	bool                  path_text;
 	struct slot_material *path_material;
 } slot_layer_t;
 
@@ -92,7 +128,7 @@ typedef struct config {
 	f32  window_scale;
 	// Render path
 	f32   rp_supersample;
-	bool  rp_ssao;
+	f32   rp_ssao;
 	f32   rp_bloom;
 	f32   rp_vignette;
 	f32   rp_grain;
@@ -115,15 +151,19 @@ typedef struct config {
 	i32                  zoom_direction;
 	bool                 wrap_mouse;
 	bool                 show_asset_names;
+	bool                 material_params;
+	bool                 brush_params;
+	bool                 mesh_params;
 	bool                 touch_ui;
 	bool                 splash_screen;
-	struct i32_array    *layout;          // Sizes
-	struct i32_array    *layout_tabs;     // Active tabs
+	bool                 header_pinned;   // Tool properties in the header, floating toolbar otherwise
+	struct i32_array    *layout_tabs;     // Docked tabs
 	i32                  camera_pivot;    // Cursor, camera center
 	i32                  camera_controls; // Orbit, rotate, fly
 	char                *server;
 	i32                  viewport_mode;
 	i32                  pathtrace_mode;
+	i32                  pathtrace_frames;
 	bool                 pressure_radius; // Pen pressure controls
 	f32                  pressure_sensitivity;
 	i32                  layer_res;
@@ -138,27 +178,19 @@ typedef struct config {
 	f32                  brush_alpha_discard;
 	i32                  dilate_radius;
 	char                *blender;
-	i32                  scene_atlas_res;
 	bool                 grid_snap;
+	bool                 auto_run_scripts;
 	bool                 experimental;
 	i32                  neural_res;
-	render_mode_t        render_mode;
-	workspace_t          workspace;
-	workflow_t           workflow;
+	i32                  console_model;
+	tools_t              tools;
 	bool                 view2d_grid_show;
 	i32                  view2d_grid_cell;
 	bool                 view2d_grid_snap;
+	bool                 pixel_snap;
+	bool                 large_asset_previews;
+	bool                 tooltips;
 } config_t;
-
-typedef struct physics_body {
-	void           *_body;
-	physics_shape_t shape;
-	f32             mass;
-	f32             dimx;
-	f32             dimy;
-	f32             dimz;
-	struct object  *obj;
-} physics_body_t;
 
 typedef struct slot_material {
 	struct ui_nodes       *nodes;
@@ -166,11 +198,10 @@ typedef struct slot_material {
 	struct gpu_texture    *image;
 	struct gpu_texture    *image_icon;
 	bool                   preview_ready;
-	struct material_data  *data;
+	struct shader_data    *data;
 	i32                    id;
 	bool                   paint_base;
 	bool                   paint_opac;
-	i32                    paint_opac_mode;
 	bool                   paint_occ;
 	bool                   paint_rough;
 	bool                   paint_met;
@@ -181,10 +212,44 @@ typedef struct slot_material {
 } slot_material_t;
 
 typedef struct tab_draw {
-	void (*f)(struct ui_handle *);
+	void (*f)(i32 *);
+	i32   id;   // tab_id_t
+	char *name; // Untranslated
+	i32   area; // tab_area_t redrawn with, -1 for views
+	bool  closed;
+	bool  closed_default;
 } tab_draw_t;
 
-typedef struct tab_draw_t_array *tab_draw_array_t;
+typedef struct dock_node {
+	struct dock_node *parent;
+	// Split
+	struct dock_node *a;         // Left or top
+	struct dock_node *b;         // Right or bottom
+	bool              vertical;  // Children are stacked
+	i32               fixed;     // 0 - ratio, 1 - a keeps the size, 2 - b keeps the size
+	f32               size;      // Ratio of a, size in pixels of the fixed child otherwise
+	bool              collapsed; // Fixed child is hidden
+	i32               role;      // dock_role_t
+	// Leaf
+	i32          tabs[32]; // tab_id_t, closed tabs included
+	i32          tab_count;
+	i32          active; // Position in between the open tabs
+	i32          last_active;
+	ui_window_t *hwnd;
+	// Layout
+	bool visible;
+	i32  x;
+	i32  y;
+	i32  w;
+	i32  h;
+} dock_node_t;
+
+typedef struct render_pass {
+	i32                 id;
+	render_pass_stage_t stage;
+	char               *handle;
+	shader_context_t   *scon;
+} render_pass_t;
 
 typedef struct context {
 	struct asset        *texture;
@@ -193,7 +258,6 @@ typedef struct context {
 	bool                 merged_object_is_atlas;
 	i32                  ddirty;  // depth
 	i32                  pdirty;  // paint
-	i32                  rdirty;  // render
 	i32                  rtdirty; // raytrace
 	bool                 brush_blend_dirty;
 	bool                 split_view;
@@ -221,10 +285,12 @@ typedef struct context {
 	f32                         format_quality;
 	export_destination_t        layers_destination;
 	bool                        export_padding;
+	bool                        bake_create_material;
 	split_type_t                split_by;
-	f32                         select_time;
+	f64                         select_time;
 	viewport_mode_t             viewport_mode;
 	void                       *viewport_shader;
+	gpu_texture_t              *viewport_texture;
 	bool                        hscale_was_changed;
 	mesh_format_t               export_mesh_format;
 	i32                         export_mesh_index;
@@ -235,14 +301,17 @@ typedef struct context {
 	f32                         last_paint_y;
 	bool                        foreground_event;
 	i32                         painted;
-	f32                         brush_time;
+	f64                         brush_time;
 	f32                         clone_start_x;
 	f32                         clone_start_y;
 	f32                         clone_delta_x;
 	f32                         clone_delta_y;
+	bool                        clone_set_source;
+	i32                         clone_layers;
 	f32                         grab_start_x;
 	f32                         grab_start_y;
 	bool                        show_compass;
+	bool                        show_grid;
 	i32                         project_type;
 	f32                         last_paint_vec_x;
 	f32                         last_paint_vec_y;
@@ -274,6 +343,7 @@ typedef struct context {
 	struct gpu_texture         *mask_preview_rgba32;
 	struct slot_layer          *mask_preview_last;
 	bool                        colorid_picked;
+	u32                         colorid_picked_color;
 	bool                        colorid_viewport_mask;
 	bool                        material_preview;
 	mat4_t                      saved_camera;
@@ -282,8 +352,10 @@ typedef struct context {
 	f32                         uvx_picked;
 	f32                         uvy_picked;
 	bool                        picker_select_material;
-	bool                        picker_paint_mask;
-	bool                        picker_viewport_mask;
+	bool                        picker_material_mask;
+	bool                        picker_color_mask;
+	f32                         picker_color_mask_tolerance;
+	bool                        picker_hide_other_materials;
 	bool                        pick_pos_nor_tex;
 	bool                        pick_object_id;
 	f32                         posx_picked;
@@ -303,12 +375,19 @@ typedef struct context {
 	bool                        brush_camera_align;
 	bool                        select_active; // Select tool
 	bool                        select_dragging;
+	bool                        select_2d;
 	f32                         select_start_x;
 	f32                         select_start_y;
 	f32                         select_x1;
 	f32                         select_y1;
 	f32                         select_x2;
 	f32                         select_y2;
+	select_mode_t               select_mode;
+	f32_array_t                *select_points;
+	f32                         select_cursor_x;
+	f32                         select_cursor_y;
+	f64                         select_click_time;
+	struct gpu_texture         *select_mask_image;
 	bool                        write_icon_on_export;
 	struct gpu_texture         *text_tool_image;
 	char                       *text_tool_text;
@@ -349,6 +428,13 @@ typedef struct context {
 	bool                        brush_stencil_scaling;
 	f32                         brush_stencil_angle;
 	bool                        brush_stencil_rotating;
+	struct asset               *view_image;
+	f32                         view_image_x;
+	f32                         view_image_y;
+	f32                         view_image_scale;
+	f32                         view_image_angle;
+	f32                         view_image_opacity;
+	i32                         view_image_action;
 	f32                         brush_nodes_scale;
 	f32                         brush_nodes_angle;
 	f32                         brush_nodes_hardness;
@@ -387,7 +473,6 @@ typedef struct context {
 	i32                         fill_type;
 	i32                         blur_type;
 	bool                        paint2d;
-	i32                         maximized_sidebar_width;
 	i32                         drag_dest;
 	vec4_t                      coords;
 	f32                         start_x;
@@ -483,21 +568,36 @@ typedef struct node_shader_context {
 } node_shader_context_t;
 
 typedef struct history_step {
-	char                  *name;
-	history_action_t       action;
-	struct ui_node_canvas *canvas; // Node history
-	i32                    canvas_group;
-	i32                    layer;
-	layer_slot_type_t      layer_type;
-	i32                    layer_parent;
-	i32                    object;
-	i32                    material;
-	i32                    brush;
-	f32                    layer_opacity;
-	i32                    layer_object;
-	i32                    layer_blending;
-	i32                    prev_order; // Previous layer position
-	i32                    canvas_type;
+	char                        *name;
+	history_action_t             action;
+	struct ui_node_canvas       *canvas; // Node history
+	i32                          canvas_group;
+	i32                          layer;
+	layer_slot_type_t            layer_type;
+	i32                          layer_parent;
+	i32                          object;
+	i32                          material;
+	i32                          brush;
+	f32                          layer_opacity;
+	i32                          layer_object;
+	i32                          layer_blending;
+	i32                          prev_order; // Previous layer position
+	i32                          canvas_type;
+	char                        *layer_name;
+	f32                          layer_scale;
+	f32                          layer_angle;
+	i32                          layer_uv_type;
+	i32                          swatch;
+	struct swatch_color         *swatch_color;
+	struct swatch_color_t_array *swatch_colors;
+	vec4_t                       object_loc;
+	quat_t                       object_rot;
+	vec4_t                       object_scale;
+	struct slot_layer_t_array   *merge_layers; // Range of the layer array on the other side of a merge
+	i32_array_t                 *merge_parents;
+	i32                          merge_start;
+	i32                          merge_length;
+	bool                         with_prev; // Undone and redone together with the previous step
 } history_step_t;
 
 typedef struct logic_node {
@@ -525,10 +625,6 @@ typedef struct logic_node_input {
 	i32                    from; // Socket index
 } logic_node_input_t;
 
-typedef struct physics_world {
-	i32 empty;
-} physics_world_t;
-
 typedef struct node_group {
 	struct ui_nodes       *nodes;
 	struct ui_node_canvas *canvas;
@@ -538,6 +634,8 @@ typedef struct {
 	char           *name;
 	string_array_t *objects;
 	string_array_t *layers;
+	string_array_t *hidden;
+	char           *nested_mesh;
 } stage_t;
 
 typedef struct {
@@ -548,9 +646,11 @@ typedef struct {
 	struct slot_font_t_array     *fonts;
 	struct slot_sound_t_array    *sounds;
 	struct node_group_t_array    *material_groups;
+	struct node_group_t_array    *mesh_groups;
 	char                         *filepath;
 	i32                           next_asset_id;
 	struct mesh_object_t_array   *paint_objects;
+	bool                          translucency; // See-through meshes, detected from the bottom layer and kept on
 } project_runtime_t;
 
 typedef struct project {
@@ -565,6 +665,9 @@ typedef struct project {
 	struct f32_array                            *camera_world;
 	struct f32_array                            *camera_origin;
 	f32                                          camera_fov;
+	f32                                          camera_near;
+	f32                                          camera_far;
+	bool                                         camera_frustum_culling;
 	struct swatch_color_t_array                 *swatches;
 	struct ui_node_canvas_t_array               *brush_nodes;
 	struct buffer_t_array                       *brush_icons;
@@ -581,6 +684,9 @@ typedef struct project {
 	struct f32_array_t_array                    *mesh_transforms;
 	struct i32_array                            *mesh_materials;
 	struct i32_array                            *mesh_parents;
+	struct i32_array                            *mesh_physics_shapes; // -1 = no physics
+	struct f32_array                            *mesh_physics_masses;
+	struct buffer_t_array                       *mesh_skins; // NULL = no skin
 	struct i32_array                            *atlas_objects;
 	struct string_array                         *atlas_names;
 	struct string_array                         *script_datas;
@@ -590,6 +696,10 @@ typedef struct project {
 	struct timeline_layer_keyframe_data_t_array *timeline_layers;
 	struct timeline_mesh_keyframe_data_t_array  *timeline_meshes;
 	struct stage_t_array                        *stages;
+	struct ui_node_canvas_t_array               *mesh_nodes;
+	struct i32_array                            *mesh_nodes_objects; // Object index for each mesh_nodes canvas
+	struct f32_array_t_array                    *mesh_paths;         // Path and curve tool points
+	struct ui_node_canvas_t_array               *mesh_groups;
 	project_runtime_t                           *_;
 } project_t;
 
@@ -654,6 +764,7 @@ typedef struct layer_data {
 	i32               path_tool;
 	bool              path_curved;
 	i32               path_material;
+	bool              path_text;
 } layer_data_t;
 
 typedef struct timeline_layer_keyframe_data {
@@ -662,6 +773,7 @@ typedef struct timeline_layer_keyframe_data {
 	struct buffer    *texpaint;
 	struct buffer    *texpaint_nor;
 	struct buffer    *texpaint_pack;
+	struct buffer    *texpaint_sculpt;
 	struct f32_array *path_points;
 	struct f32_array *path_points_world;
 	struct f32_array *path_points_camera;
@@ -670,6 +782,7 @@ typedef struct timeline_layer_keyframe_data {
 } timeline_layer_keyframe_data_t;
 
 typedef struct timeline_mesh_keyframe_data {
+	i32               stage_index;
 	i32               frame;
 	i32               mesh_index;
 	struct f32_array *transform;
@@ -697,17 +810,24 @@ typedef struct plugin {
 	minic_ctx_t *ctx;
 } plugin_t;
 
+typedef struct plugin_tool {
+	plugin_t      *plugin;
+	char          *name;
+	char          *tooltip;
+	i32            icon;
+	void          *on_header;
+	void          *on_stroke;
+	void          *on_stroke_end;
+	gpu_texture_t *overlay; // Tinted over the mesh in the viewport while the tool is active
+	i32            overlay_color;
+} plugin_tool_t;
+
 typedef struct rect {
 	i32 x;
 	i32 y;
 	i32 w;
 	i32 h;
 } rect_t;
-
-typedef struct parse_node_preview_result {
-	struct shader_context   *scon;
-	struct material_context *mcon;
-} parse_node_preview_result_t;
 
 typedef struct ui_node_t_array *node_list_t;
 
@@ -729,6 +849,7 @@ typedef struct neural_node_model {
 	struct string_array *urls;
 	char                *web;
 	char                *license;
+	bool                 expanded; // Preferences panel
 } neural_node_model_t;
 
 typedef struct float_node {
@@ -772,12 +893,6 @@ typedef struct mesh_object_t_array {
 	int             length;
 	int             capacity;
 } mesh_object_t_array_t;
-
-typedef struct ui_handle_t_array {
-	ui_handle_t **buffer;
-	int           length;
-	int           capacity;
-} ui_handle_t_array_t;
 
 typedef struct ui_node_canvas_t_array {
 	ui_node_canvas_t **buffer;
@@ -827,15 +942,6 @@ typedef struct gpu_texture_t_array {
 	int             capacity;
 } gpu_texture_t_array_t;
 
-#ifdef WITH_PHYSICS
-#include "../libs/asim.h"
-typedef struct physics_pair_t_array {
-	physics_pair_t **buffer;
-	int              length;
-	int              capacity;
-} physics_pair_t_array_t;
-#endif
-
 typedef struct ui_node_socket_t_array {
 	ui_node_socket_t **buffer;
 	int                length;
@@ -871,18 +977,6 @@ typedef struct history_step_t_array {
 	int              length;
 	int              capacity;
 } history_step_t_array_t;
-
-typedef struct tab_draw_array_t_array {
-	tab_draw_array_t **buffer;
-	int                length;
-	int                capacity;
-} tab_draw_array_t_array_t;
-
-typedef struct tab_draw_t_array {
-	tab_draw_t **buffer;
-	int          length;
-	int          capacity;
-} tab_draw_t_array_t;
 
 typedef struct object_t_array {
 	object_t **buffer;
@@ -954,7 +1048,6 @@ typedef struct material_data2 {
 	bool paint_height;
 	bool paint_emis;
 	bool paint_subs;
-	int  opac_mode;
 } material_data2_t;
 
 typedef struct material_data2_t_array {
@@ -986,3 +1079,14 @@ typedef struct stage_t_array {
 	int       length;
 	int       capacity;
 } stage_t_array_t;
+
+// Per node ui state of the custom node editors (ui_nodes_editor_state())
+typedef struct ui_nodes_editor_state {
+	i32              channel;
+	f32              index[4];
+	f32              x;
+	f32              y;
+	i32              interp;
+	ui_color_state_t color_state;
+	i32              line;
+} ui_nodes_editor_state_t;

@@ -5,9 +5,9 @@ void *plugin;
 // Register custom viewport shader
 void viewport_shader(void *shader) {
 	node_shader_write_frag(shader, " \
-		var light_dir: float3 = float3(0.5, 0.5, -0.5);\
-		var dotnl: float = max(dot(n, light_dir), 0.0); \
-		output_color = basecol * step(0.5, dotnl) + basecol; \
+		float3 light_dir = float3(0.5, 0.5, -0.5);\
+		float dotnl = max(dot(n, light_dir), 0.0); \
+		output_color = basecol * (0.5 + 0.5 * step(0.5, dotnl)); \
 	");
 };
 
@@ -17,7 +17,6 @@ void on_delete() {
 
 void main() {
 	plugin = plugin_create();
-	gc_root(plugin);
 
 	context_set_viewport_shader(viewport_shader);
 	plugin_notify_on_delete(plugin, on_delete);

@@ -51,7 +51,7 @@ buffer_t *util_encode_scene(scene_t *raw) {
 	i32       size    = 8 * 1024 * 1024 + util_encode_mesh_data_size(raw->mesh_datas);
 	buffer_t *encoded = buffer_create(size);
 	armpack_encode_start(encoded->buffer);
-	armpack_encode_map(13);
+	armpack_encode_map(9);
 	armpack_encode_string("name");
 	armpack_encode_null();
 	armpack_encode_string("objects");
@@ -68,10 +68,6 @@ buffer_t *util_encode_scene(scene_t *raw) {
 	armpack_encode_string("world_datas");
 	armpack_encode_null();
 	armpack_encode_string("world_ref");
-	armpack_encode_null();
-	armpack_encode_string("speaker_datas"); // TODO: deprecated
-	armpack_encode_null();
-	armpack_encode_string("embedded_datas");
 	armpack_encode_null();
 	i32 ei          = armpack_encode_end();
 	encoded->length = ei;
@@ -164,6 +160,10 @@ i32 util_encode_timeline_layers_size(timeline_layer_keyframe_data_t_array_t *dat
 		if (tp_pack != NULL) {
 			size += tp_pack->length;
 		}
+		buffer_t *tp_sculpt = datas->buffer[i]->texpaint_sculpt;
+		if (tp_sculpt != NULL) {
+			size += tp_sculpt->length;
+		}
 		f32_array_t *pp = datas->buffer[i]->path_points;
 		if (pp != NULL) {
 			size += pp->length * 4;
@@ -201,12 +201,13 @@ i32 util_encode_timeline_meshes_size(timeline_mesh_keyframe_data_t_array_t *data
 buffer_t *util_encode_project(project_t *raw) {
 	i32 size = 32 * 1024 * 1024 + util_encode_layer_data_size(raw->layer_datas) + util_encode_mesh_data_size(raw->mesh_datas) +
 	           util_encode_packed_assets_size(raw->packed_assets) + util_encode_buffers_size(raw->brush_icons) + util_encode_buffers_size(raw->material_icons) +
-	           util_encode_buffers_size(raw->mesh_icons) + util_encode_f32_arrays_size(raw->mesh_transforms) +
-	           util_encode_timeline_layers_size(raw->timeline_layers) + util_encode_timeline_meshes_size(raw->timeline_meshes);
+	           util_encode_buffers_size(raw->mesh_icons) + util_encode_buffers_size(raw->mesh_skins) + util_encode_f32_arrays_size(raw->mesh_transforms) +
+	           util_encode_f32_arrays_size(raw->mesh_paths) + util_encode_timeline_layers_size(raw->timeline_layers) +
+	           util_encode_timeline_meshes_size(raw->timeline_meshes);
 	buffer_t *encoded = buffer_create(size);
 
 	armpack_encode_start(encoded->buffer);
-	armpack_encode_map(36);
+	armpack_encode_map(46);
 
 	armpack_encode_string("version");
 	armpack_encode_string(raw->version);
@@ -242,6 +243,12 @@ buffer_t *util_encode_project(project_t *raw) {
 	armpack_encode_array_f32(raw->camera_origin);
 	armpack_encode_string("camera_fov");
 	armpack_encode_f32(raw->camera_fov);
+	armpack_encode_string("camera_near");
+	armpack_encode_f32(raw->camera_near);
+	armpack_encode_string("camera_far");
+	armpack_encode_f32(raw->camera_far);
+	armpack_encode_string("camera_frustum_culling");
+	armpack_encode_bool(raw->camera_frustum_culling);
 	armpack_encode_string("swatches");
 	if (raw->swatches != NULL) {
 		armpack_encode_array(raw->swatches->length);
@@ -330,7 +337,7 @@ buffer_t *util_encode_project(project_t *raw) {
 	if (raw->material_datas != NULL) {
 		armpack_encode_array(raw->material_datas->length);
 		for (i32 i = 0; i < raw->material_datas->length; ++i) {
-			armpack_encode_map(10);
+			armpack_encode_map(9);
 			armpack_encode_string("paint_base");
 			armpack_encode_bool(raw->material_datas->buffer[i]->paint_base);
 			armpack_encode_string("paint_opac");
@@ -349,8 +356,6 @@ buffer_t *util_encode_project(project_t *raw) {
 			armpack_encode_bool(raw->material_datas->buffer[i]->paint_emis);
 			armpack_encode_string("paint_subs");
 			armpack_encode_bool(raw->material_datas->buffer[i]->paint_subs);
-			armpack_encode_string("opac_mode");
-			armpack_encode_i32(raw->material_datas->buffer[i]->opac_mode);
 		}
 	}
 	else {
@@ -366,7 +371,7 @@ buffer_t *util_encode_project(project_t *raw) {
 	if (raw->layer_datas != NULL) {
 		armpack_encode_array(raw->layer_datas->length);
 		for (i32 i = 0; i < raw->layer_datas->length; ++i) {
-			armpack_encode_map(36);
+			armpack_encode_map(37);
 			armpack_encode_string("name");
 			armpack_encode_string(raw->layer_datas->buffer[i]->name);
 			armpack_encode_string("res");
@@ -439,6 +444,8 @@ buffer_t *util_encode_project(project_t *raw) {
 			armpack_encode_bool(raw->layer_datas->buffer[i]->path_curved);
 			armpack_encode_string("path_material");
 			armpack_encode_i32(raw->layer_datas->buffer[i]->path_material);
+			armpack_encode_string("path_text");
+			armpack_encode_bool(raw->layer_datas->buffer[i]->path_text);
 		}
 	}
 	else {
@@ -478,6 +485,23 @@ buffer_t *util_encode_project(project_t *raw) {
 	armpack_encode_string("mesh_parents");
 	armpack_encode_array_i32(raw->mesh_parents);
 
+	armpack_encode_string("mesh_physics_shapes");
+	armpack_encode_array_i32(raw->mesh_physics_shapes);
+
+	armpack_encode_string("mesh_physics_masses");
+	armpack_encode_array_f32(raw->mesh_physics_masses);
+
+	armpack_encode_string("mesh_skins");
+	if (raw->mesh_skins != NULL) {
+		armpack_encode_array(raw->mesh_skins->length);
+		for (i32 i = 0; i < raw->mesh_skins->length; ++i) {
+			armpack_encode_array_u8(raw->mesh_skins->buffer[i]);
+		}
+	}
+	else {
+		armpack_encode_null();
+	}
+
 	armpack_encode_string("atlas_objects");
 	armpack_encode_array_i32(raw->atlas_objects);
 	armpack_encode_string("atlas_names");
@@ -496,7 +520,7 @@ buffer_t *util_encode_project(project_t *raw) {
 	if (raw->timeline_layers != NULL) {
 		armpack_encode_array(raw->timeline_layers->length);
 		for (i32 i = 0; i < raw->timeline_layers->length; ++i) {
-			armpack_encode_map(10);
+			armpack_encode_map(11);
 			armpack_encode_string("frame");
 			armpack_encode_i32(raw->timeline_layers->buffer[i]->frame);
 			armpack_encode_string("layer_index");
@@ -507,6 +531,8 @@ buffer_t *util_encode_project(project_t *raw) {
 			armpack_encode_array_u8(raw->timeline_layers->buffer[i]->texpaint_nor);
 			armpack_encode_string("texpaint_pack");
 			armpack_encode_array_u8(raw->timeline_layers->buffer[i]->texpaint_pack);
+			armpack_encode_string("texpaint_sculpt");
+			armpack_encode_array_u8(raw->timeline_layers->buffer[i]->texpaint_sculpt);
 			armpack_encode_string("path_points");
 			armpack_encode_array_f32(raw->timeline_layers->buffer[i]->path_points);
 			armpack_encode_string("path_points_world");
@@ -527,7 +553,9 @@ buffer_t *util_encode_project(project_t *raw) {
 	if (raw->timeline_meshes != NULL) {
 		armpack_encode_array(raw->timeline_meshes->length);
 		for (i32 i = 0; i < raw->timeline_meshes->length; ++i) {
-			armpack_encode_map(4);
+			armpack_encode_map(5);
+			armpack_encode_string("stage_index");
+			armpack_encode_i32(raw->timeline_meshes->buffer[i]->stage_index);
 			armpack_encode_string("frame");
 			armpack_encode_i32(raw->timeline_meshes->buffer[i]->frame);
 			armpack_encode_string("mesh_index");
@@ -546,13 +574,52 @@ buffer_t *util_encode_project(project_t *raw) {
 	if (raw->stages != NULL) {
 		armpack_encode_array(raw->stages->length);
 		for (i32 i = 0; i < raw->stages->length; ++i) {
-			armpack_encode_map(3);
+			armpack_encode_map(5);
 			armpack_encode_string("name");
 			armpack_encode_string(raw->stages->buffer[i]->name);
 			armpack_encode_string("objects");
 			armpack_encode_array_string(raw->stages->buffer[i]->objects);
 			armpack_encode_string("layers");
 			armpack_encode_array_string(raw->stages->buffer[i]->layers);
+			armpack_encode_string("hidden");
+			armpack_encode_array_string(raw->stages->buffer[i]->hidden);
+			armpack_encode_string("nested_mesh");
+			armpack_encode_string(raw->stages->buffer[i]->nested_mesh);
+		}
+	}
+	else {
+		armpack_encode_null();
+	}
+
+	armpack_encode_string("mesh_nodes");
+	if (raw->mesh_nodes != NULL) {
+		armpack_encode_array(raw->mesh_nodes->length);
+		for (i32 i = 0; i < raw->mesh_nodes->length; ++i) {
+			util_encode_node_canvas(raw->mesh_nodes->buffer[i]);
+		}
+	}
+	else {
+		armpack_encode_null();
+	}
+	armpack_encode_string("mesh_nodes_objects");
+	armpack_encode_array_i32(raw->mesh_nodes_objects);
+
+	armpack_encode_string("mesh_paths");
+	if (raw->mesh_paths != NULL) {
+		armpack_encode_array(raw->mesh_paths->length);
+		for (i32 i = 0; i < raw->mesh_paths->length; ++i) {
+			armpack_encode_array_f32(raw->mesh_paths->buffer[i]);
+		}
+	}
+	else {
+		armpack_encode_null();
+	}
+
+	armpack_encode_string("mesh_groups");
+	if (raw->mesh_groups != NULL) {
+		armpack_encode_array(raw->mesh_groups->length);
+		for (i32 i = 0; i < raw->mesh_groups->length; ++i) {
+			util_encode_node_canvas(raw->mesh_groups->buffer[i]);
 		}
 	}
 	else {

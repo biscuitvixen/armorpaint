@@ -1,34 +1,26 @@
 
 #include "global.h"
 
-i32            base_drag_tint  = 0xffffffff;
-i32            base_drag_size  = -1;
-rect_t        *base_drag_rect  = NULL;
-f32            base_drag_start = 0.0;
-f32            base_drop_x     = 0.0;
-f32            base_drop_y     = 0.0;
-gpu_texture_t *base_color_wheel;
-gpu_texture_t *base_color_wheel_gradient;
-i32            base_appx               = 0;
-i32            base_appy               = 0;
-i32            base_last_window_width  = 0;
-i32            base_last_window_height = 0;
-bool           base_start_arm_found    = false;
-i32            _base_material_count;
+#ifdef IRON_ANDROID
+#include "backends/android_system.h"
+#endif
+
+i32     base_drag_tint          = 0xffffffff;
+i32     base_drag_size          = -1;
+rect_t *base_drag_rect          = NULL;
+f32     base_drag_start         = 0.0;
+f32     base_drop_x             = 0.0;
+f32     base_drop_y             = 0.0;
+i32     base_last_window_width  = 0;
+i32     base_last_window_height = 0;
+bool    base_start_arm_found    = false;
+i32     _base_material_count;
 
 void base_on_shutdown() {
 #if defined(IRON_ANDROID) || defined(IRON_IOS)
 	project_save(false);
 #endif
 	config_save();
-}
-
-void base_on_background() {
-	// Release keys after alt-tab / win-tab
-	_key_up(KEY_CODE_ALT, NULL);
-	_key_up(KEY_CODE_WIN, NULL);
-	_key_up(KEY_CODE_CONTROL, NULL);
-	_key_up(KEY_CODE_SHIFT, NULL);
 }
 
 void base_on_foreground() {
@@ -46,12 +38,7 @@ void base_init_on_start_arm(void *_) {
 	if (base_start_arm_found) {
 		import_arm_run_project(g_project->_->filepath);
 	}
-	g_context->tool = TOOL_TYPE_CURSOR;
-	// Auto-run main script
-	if (g_project->script_datas != NULL && g_project->script_datas->length > 0) {
-		minic_ctx_t *ctx = minic_eval(g_project->script_datas->buffer[0]);
-	}
-	tab_timeline_play();
+	player_run_scripts();
 }
 
 void base_save_window_rect() {
@@ -63,6 +50,9 @@ void base_save_window_rect() {
 }
 
 void base_save_and_quit_callback(bool save) {
+	if (viewport_recording) {
+		viewport_capture_video_end();
+	}
 	base_save_window_rect();
 	if (save) {
 		project_save(true);
@@ -70,6 +60,11 @@ void base_save_and_quit_callback(bool save) {
 	else {
 		iron_stop();
 	}
+}
+
+void base_material_dropped_export(char *path) {
+	export_arm_run_material(path);
+	tab_browser_refresh = true;
 }
 
 void base_material_dropped() {
@@ -90,16 +85,25 @@ void base_material_dropped() {
 	else if (context_in_materials()) {
 		tab_materials_accept_material_drop(base_drag_material);
 	}
-	gc_unroot(base_drag_material);
+	else if (context_in_meshes()) {
+		tab_meshes_accept_material_drop(base_drag_material);
+	}
+	else if (context_in_browser() && iron_is_directory(tab_browser_path)) {
+		// Export material into the browser directory
+		char *name = base_drag_material->canvas->name;
+		char *path = string("%s%s%s.arm", tab_browser_path, PATH_SEP, name);
+		for (i32 i = 1; iron_file_exists(path); ++i) {
+			path = string("%s%s%s.%03d.arm", tab_browser_path, PATH_SEP, name, i);
+		}
+		sys_notify_on_next_frame(&base_material_dropped_export, path);
+	}
 	base_drag_material = NULL;
 }
 
 void base_update_import_asset_done() {
 	// Asset was material
 	if (g_project->_->materials->length > _base_material_count) {
-		gc_unroot(base_drag_material);
 		base_drag_material = g_context->material;
-		gc_root(base_drag_material);
 		base_material_dropped();
 	}
 }
@@ -122,7 +126,6 @@ void base_handle_drop_paths() {
 gpu_texture_t *base_get_drag_image() {
 	base_drag_tint = 0xffffffff;
 	base_drag_size = -1;
-	gc_unroot(base_drag_rect);
 	base_drag_rect = NULL;
 	if (base_drag_asset != NULL) {
 		return project_get_image(base_drag_asset);
@@ -137,10 +140,8 @@ gpu_texture_t *base_get_drag_image() {
 			return base_drag_file_icon;
 		}
 		gpu_texture_t *icons = resource_get("icons.k");
-		gc_unroot(base_drag_rect);
-		base_drag_rect = string_index_of(base_drag_file, ".") > 0 ? resource_tile50(icons, ICON_FILE) : resource_tile50(icons, ICON_FOLDER_FULL);
-		gc_root(base_drag_rect);
-		base_drag_tint = g_theme->HIGHLIGHT_COL;
+		base_drag_rect       = string_index_of(base_drag_file, ".") > 0 ? resource_tile50(icons, ICON_FILE) : resource_tile50(icons, ICON_FOLDER_FULL);
+		base_drag_tint       = g_theme->HIGHLIGHT_COL;
 		return icons;
 	}
 
@@ -153,14 +154,17 @@ gpu_texture_t *base_get_drag_image() {
 	if (base_drag_font != NULL) {
 		return base_drag_font->image;
 	}
+	if (base_drag_sound != NULL) {
+		gpu_texture_t *icons = resource_get("icons.k");
+		base_drag_rect       = resource_tile50(icons, ICON_MUSIC);
+		return icons;
+	}
 	if (base_drag_layer != NULL && slot_layer_is_group(base_drag_layer)) {
 		gpu_texture_t *icons         = resource_get("icons.k");
 		rect_t        *folder_closed = resource_tile50(icons, ICON_FOLDER_FULL);
 		rect_t        *folder_open   = resource_tile50(icons, ICON_FOLDER_OPEN);
-		gc_unroot(base_drag_rect);
-		base_drag_rect = base_drag_layer->show_panel ? folder_open : folder_closed;
-		gc_root(base_drag_rect);
-		base_drag_tint = base_darker(g_theme->LABEL_COL, 0x00202020);
+		base_drag_rect               = base_drag_layer->show_panel ? folder_open : folder_closed;
+		base_drag_tint               = base_darker(g_theme->LABEL_COL, 0x00202020);
 		return icons;
 	}
 	if (base_drag_layer != NULL && slot_layer_is_mask(base_drag_layer) && base_drag_layer->fill_material == NULL) {
@@ -176,10 +180,8 @@ gpu_texture_t *base_get_drag_image() {
 			return preview;
 		}
 		gpu_texture_t *icons = resource_get("icons.k");
-		gc_unroot(base_drag_rect);
-		base_drag_rect = resource_tile50(icons, ICON_CUBE);
-		gc_root(base_drag_rect);
-		base_drag_tint = g_theme->BUTTON_COL;
+		base_drag_rect       = resource_tile50(icons, ICON_CUBE);
+		base_drag_tint       = g_theme->BUTTON_COL;
 		return icons;
 	}
 	return NULL;
@@ -195,25 +197,50 @@ rect_t *base_get_drag_background() {
 
 void base_init_undo_layers() {
 	if (history_undo_layers == NULL) {
-		gc_unroot(history_undo_layers);
 		history_undo_layers = any_array_create_from_raw((void *[]){}, 0);
-		gc_root(history_undo_layers);
 		for (i32 i = 0; i < g_config->undo_steps; ++i) {
 			i32           len = history_undo_layers->length;
 			char         *ext = string("_undo%s", i32_to_string(len));
-			slot_layer_t *l   = slot_layer_create(ext, LAYER_SLOT_TYPE_LAYER, NULL);
+			slot_layer_t *l   = slot_layer_create_undo(ext);
 			any_array_push(history_undo_layers, l);
 		}
+		slot_layer_alloc_textures(history_undo_layers->buffer[history_undo_i]);
 	}
 }
 
+static void base_draw_console_lines() {
+	// Show last console lines in distract free mode
+	f32 scale = UI_SCALE();
+	draw_begin(NULL, false, 0);
+	draw_set_font(g_font, math_floor(UI_FONT_SIZE()));
+	draw_set_color(g_theme->TEXT_COL);
+	f32 line_h = draw_font_height(draw_font, draw_font_size) * 1.2;
+	f32 x      = 10 * scale;
+	f32 y      = iron_window_height() - 10 * scale - line_h;
+	i32 n      = 0;
+	for (i32 i = console_last_traces->length - 1; i >= 0 && n < 5; --i) {
+		any_array_t *parts = string_split(console_last_traces->buffer[i], "\n");
+		for (i32 j = parts->length - 1; j >= 0 && n < 5; --j) {
+			draw_string(parts->buffer[j], x, y - n * line_h);
+			n++;
+		}
+		string_split_free(parts);
+	}
+	draw_set_color(0xffffffff);
+	draw_end();
+}
+
 void base_update(void *_) {
+	if (g_project->_->translucency && any_map_get(render_path_render_targets, "main_paint") == NULL) {
+		render_path_base_init_paint_depth();
+	}
+
 	if (mouse_movement_x != 0 || mouse_movement_y != 0) {
 		iron_mouse_set_cursor(IRON_CURSOR_ARROW);
 	}
 
 	bool has_drag = base_drag_asset != NULL || base_drag_material != NULL || base_drag_layer != NULL || base_drag_file != NULL || base_drag_swatch != NULL ||
-	                base_drag_brush != NULL || base_drag_font != NULL || base_drag_mesh != NULL;
+	                base_drag_brush != NULL || base_drag_font != NULL || base_drag_sound != NULL || base_drag_mesh != NULL;
 
 	if (g_config->touch_ui) {
 		// Touch and hold to activate dragging
@@ -231,25 +258,17 @@ void base_update(void *_) {
 		}
 		bool moved = math_abs(mouse_movement_x) > 1 && math_abs(mouse_movement_y) > 1;
 		if ((mouse_released("left") || moved) && !has_drag) {
-			gc_unroot(base_drag_asset);
-			base_drag_asset = NULL;
-			gc_unroot(base_drag_swatch);
-			base_drag_swatch = NULL;
-			gc_unroot(base_drag_file);
-			base_drag_file = NULL;
-			gc_unroot(base_drag_file_icon);
+			base_drag_asset     = NULL;
+			base_drag_swatch    = NULL;
+			base_drag_file      = NULL;
 			base_drag_file_icon = NULL;
 			base_is_dragging    = false;
-			gc_unroot(base_drag_material);
-			base_drag_material = NULL;
-			gc_unroot(base_drag_layer);
-			base_drag_layer = NULL;
-			gc_unroot(base_drag_mesh);
-			base_drag_mesh = NULL;
-			gc_unroot(base_drag_brush);
-			base_drag_brush = NULL;
-			gc_unroot(base_drag_font);
-			base_drag_font = NULL;
+			base_drag_material  = NULL;
+			base_drag_layer     = NULL;
+			base_drag_mesh      = NULL;
+			base_drag_brush     = NULL;
+			base_drag_font      = NULL;
+			base_drag_sound     = NULL;
 		}
 		// Disable touch scrolling while dragging is active
 		ui_touch_control = !base_is_dragging;
@@ -266,9 +285,12 @@ void base_update(void *_) {
 				ui_nodes_accept_asset_drop(array_index_of(g_project->_->assets, base_drag_asset));
 			}
 			else if (context_in_3d_view()) {
-				if (ends_with(to_lower_case(base_drag_asset->file), ".hdr")) {
+				if (path_has_ext(base_drag_asset->file, "hdr")) {
 					gpu_texture_t *image = project_get_image(base_drag_asset);
 					import_envmap_run(base_drag_asset->file, image);
+				}
+				else {
+					util_stencil_view_image_open(base_drag_asset, (mouse_x - base_view_x(0)) / (f32)base_view_w(), (mouse_y - base_appy) / (f32)base_h());
 				}
 			}
 			// Create mask
@@ -278,7 +300,6 @@ void base_update(void *_) {
 			else if (context_in_textures()) {
 				tab_textures_accept_asset_drop(base_drag_asset);
 			}
-			gc_unroot(base_drag_asset);
 			base_drag_asset = NULL;
 		}
 		else if (base_drag_swatch != NULL) {
@@ -303,7 +324,6 @@ void base_update(void *_) {
 				layers_create_color_layer(color, base_drag_swatch->occlusion, base_drag_swatch->roughness, base_drag_swatch->metallic, g_context->drag_dest);
 			}
 
-			gc_unroot(base_drag_swatch);
 			base_drag_swatch = NULL;
 		}
 		else if (base_drag_file != NULL) {
@@ -315,9 +335,7 @@ void base_update(void *_) {
 				import_asset_run(base_drag_file, base_drop_x, base_drop_y, true, true, &base_update_import_asset_done);
 			}
 
-			gc_unroot(base_drag_file);
-			base_drag_file = NULL;
-			gc_unroot(base_drag_file_icon);
+			base_drag_file      = NULL;
 			base_drag_file_icon = NULL;
 		}
 		else if (base_drag_material != NULL) {
@@ -331,29 +349,31 @@ void base_update(void *_) {
 				slot_layer_move(base_drag_layer, g_context->drag_dest);
 				make_material_parse_mesh_material();
 			}
-			gc_unroot(base_drag_layer);
 			base_drag_layer = NULL;
 		}
 		else if (base_drag_mesh != NULL) {
 			if (context_in_meshes() && base_is_dragging) {
 				tab_meshes_accept_mesh_drop(base_drag_mesh);
 			}
-			gc_unroot(base_drag_mesh);
 			base_drag_mesh = NULL;
 		}
 		else if (base_drag_brush != NULL) {
 			if (context_in_brushes()) {
 				tab_brushes_accept_brush_drop(base_drag_brush);
 			}
-			gc_unroot(base_drag_brush);
 			base_drag_brush = NULL;
 		}
 		else if (base_drag_font != NULL) {
 			if (context_in_fonts()) {
 				tab_fonts_accept_font_drop(base_drag_font);
 			}
-			gc_unroot(base_drag_font);
 			base_drag_font = NULL;
+		}
+		else if (base_drag_sound != NULL) {
+			if (context_in_sounds()) {
+				tab_sounds_accept_sound_drop(base_drag_sound);
+			}
+			base_drag_sound = NULL;
 		}
 
 		iron_mouse_set_cursor(IRON_CURSOR_ARROW);
@@ -366,26 +386,25 @@ void base_update(void *_) {
 
 	base_handle_drop_paths();
 
-	if (g_context->ddirty < 0) {
-		g_context->ddirty = 0;
-	}
-
-	if (g_context->tool == TOOL_TYPE_CURSOR && context_in_3d_view()) {
+	if (g_context->tool == TOOL_TYPE_CURSOR && context_in_3d_view() && !context_object_deselected()) {
 		if (keyboard_down("control") && keyboard_started("d")) {
-			sim_duplicate();
+			util_mesh_duplicate();
 		}
 		if (keyboard_started("delete")) {
-			sim_delete();
+			util_mesh_delete();
+		}
+		if (keyboard_started("h") && !g_ui->is_typing && g_context->paint_object != NULL) {
+			tab_meshes_toggle_visible(g_context->paint_object);
 		}
 	}
 
-	// Live material when using sys_time() script node
+	// Live material when using sys_time() script node or a shader node reading constants.time / constants.frame
 	if (g_context->tool == TOOL_TYPE_MATERIAL) {
 		bool              has_script_node = false;
 		ui_node_canvas_t *canvas          = g_context->material->canvas;
 		for (i32 i = 0; i < canvas->nodes->length; ++i) {
 			ui_node_t *n = canvas->nodes->buffer[i];
-			if (string_equals(n->type, "SCRIPT_CPU")) {
+			if ((string_equals(n->type, "SCRIPT_CPU") && project_scripts_trusted) || (string_equals(n->type, "SHADER_GPU") && shader_node_is_live(n))) {
 				has_script_node = true;
 				break;
 			}
@@ -398,25 +417,45 @@ void base_update(void *_) {
 
 	render_compass_update();
 
-	// if (g_config->workspace == WORKSPACE_PLAYER) {
 	if (args_player) {
 		player_update();
 	}
+	else {
+		tab_timeline_update();
+		layers_update_frame_fill_layers();
+	}
 
+	if (base_workspace_pending) {
+		base_apply_workspace();
+	}
+	ui_dock_update();
 	ui_view2d_update(NULL);
 	ui_nodes_update(NULL);
 	ui_base_update(NULL);
 	camera_update(NULL);
 
-	// Render
-	if (g_context->tool == TOOL_TYPE_CURSOR) {
-		sim_init();
-		sim_update();
+	bool in_3d               = mouse_view_x() >= 0 && mouse_view_x() <= sys_w() && mouse_view_y() >= 0 && mouse_view_y() <= sys_h();
+	iron_mouse_trackpad_drag = base_ui_enabled && (in_3d || context_in_2d_view(ui_view2d_type) || context_in_nodes());
+
+	if (base_player) {
+		player_running             = true;
+		render_path_raytrace_ready = false;
+		physics_world_update();
+		iron_delay_idle_sleep();
+	}
+	else if (player_running) {
+		player_running = false;
+	}
+
+	if (player_running || tab_timeline_playing) {
+		if (g_context->ddirty < 0) {
+			g_context->ddirty = 0;
+		}
 	}
 
 	if (g_context->frame == 2) {
 		util_render_make_material_preview();
-		ui_base_hwnds->buffer[TAB_AREA_SIDEBAR1]->redraws = 2;
+		ui_dock_redraw(TAB_AREA_SIDEBAR1);
 		base_init_undo_layers();
 
 		make_material_parse_mesh_material();
@@ -454,27 +493,47 @@ void base_update(void *_) {
 		draw_end();
 	}
 
-	// Select tool rectangle mask
-	if (g_context->select_active || g_context->select_dragging) {
-		f32 x1 = g_context->select_x1 * sys_w() + sys_x();
-		f32 y1 = g_context->select_y1 * sys_h() + sys_y();
-		f32 x2 = g_context->select_x2 * sys_w() + sys_x();
-		f32 y2 = g_context->select_y2 * sys_h() + sys_y();
+	ui_dock_render_drag();
+
+	// Select tool mask
+	if ((g_context->select_active || g_context->select_dragging) && !g_context->select_2d) {
 		draw_begin(NULL, false, 0);
 		draw_set_color(g_context->select_dragging ? 0xffffffff : 0xaaffffff);
-		draw_rect(x1, y1, x2 - x1, y2 - y1, 1.0);
+		if (g_context->select_mode == SELECT_MODE_POLYGON) {
+			util_draw_select_shape(sys_x(), sys_y(), sys_w(), sys_h());
+		}
+		else {
+			f32 x1 = g_context->select_x1 * sys_w() + sys_x();
+			f32 y1 = g_context->select_y1 * sys_h() + sys_y();
+			f32 x2 = g_context->select_x2 * sys_w() + sys_x();
+			f32 y2 = g_context->select_y2 * sys_h() + sys_y();
+			util_draw_select_shape(math_min(x1, x2), math_min(y1, y2), math_abs(x2 - x1), math_abs(y2 - y1));
+		}
 		draw_set_color(0xffffffff);
 		draw_end();
 	}
 
 	bool using_menu = ui_menu_show && mouse_y > ui_header_h;
-	base_ui_enabled = !ui_box_show && !using_menu && g_ui->combo_selected_handle == NULL;
+	base_ui_enabled = !ui_box_show && !using_menu && g_ui->combo_selected_id == 0 && !agent_running && !(ui_nodes_show && ui_nodes_popup_hovered());
 
+	if (viewport_recording) {
+		viewport_capture_video_draw();
+	}
+	if (!ui_base_show && !player_in_editor && !base_player_lock && gpu_framebuffer_redirect == NULL) {
+		base_draw_console_lines();
+	}
+	ui_nodes_render_popup();
 	if (ui_box_show) {
 		ui_box_render();
 	}
 	if (ui_menu_show) {
 		ui_menu_render();
+	}
+
+	if (agent_running && gpu_framebuffer_redirect == NULL) {
+		draw_begin(NULL, false, 0);
+		agent_draw_overlay();
+		draw_end();
 	}
 
 #if defined(IRON_ANDROID) || defined(IRON_IOS)
@@ -491,17 +550,12 @@ void base_init() {
 	base_last_window_height = iron_window_height();
 
 	sys_notify_on_drop_files(&base_on_drop_files);
-	sys_notify_on_app_state(&base_on_foreground, &base_on_background, &base_on_shutdown);
+	sys_notify_on_app_state(&base_on_foreground, NULL, &base_on_shutdown);
 	iron_set_save_and_quit_callback(base_save_and_quit_callback);
+	agent_init();
 
 	g_font = data_get_font("font.ttf");
-	gc_root(g_font);
 
-	base_color_wheel = data_get_texture("color_wheel.k");
-	gc_root(base_color_wheel);
-
-	base_color_wheel_gradient = data_get_texture("color_wheel_gradient.k");
-	gc_root(base_color_wheel_gradient);
 	config_load_theme(g_config->theme, false);
 	base_default_element_w = g_theme->ELEMENT_W;
 	base_default_element_h = g_theme->ELEMENT_H;
@@ -509,7 +563,6 @@ void base_init() {
 	translator_load_translations(g_config->locale);
 
 	ui_files_filename = string_copy(tr("untitled"));
-	gc_root(ui_files_filename);
 #if defined(IRON_ANDROID) || defined(IRON_IOS)
 	sys_title_set(tr("untitled"));
 #endif
@@ -522,9 +575,8 @@ void base_init() {
 		draw_font_init(g_font);
 	}
 
-	ui_nodes_enum_texts  = base_combo_enum_texts;
+	ui_nodes_enum_texts    = base_combo_enum_texts;
 	ui_nodes_enum_textures = base_combo_enum_textures;
-	gc_root(ui_nodes_enum_texts);
 
 	// Init plugins
 	if (g_config->plugins != NULL) {
@@ -546,21 +598,13 @@ void base_init() {
 
 	sys_notify_on_update(base_update, NULL);
 
-	base_appx = ui_toolbar_w(true);
-	base_appy = 0;
-	if (g_config->layout->buffer[LAYOUT_SIZE_HEADER] == 1) {
-		base_appy = ui_header_h * 2;
-	}
 	scene_camera->data->fov = math_floor(scene_camera->data->fov * 100) / 100.0;
 	camera_object_build_proj(scene_camera, -1.0);
 
 	args_run();
 
-	if (g_config->workspace != WORKSPACE_PAINT_3D) {
-		base_update_workspace();
-	}
-	if (g_config->workflow != WORKFLOW_PBR) {
-		base_update_workflow();
+	if (g_config->tools != TOOLS_PAINT) {
+		base_update_tools();
 	}
 
 	g_context->camera_pivot    = g_config->camera_pivot;
@@ -573,6 +617,18 @@ void base_init() {
 
 	// Startup project
 	char *start_arm = string("%s/start.arm", iron_internal_files_location());
+
+#ifdef IRON_WASM
+	start_arm = "./start.arm";
+#endif
+
+#ifdef IRON_ANDROID
+	start_arm = string("%s/start.arm", iron_android_get_activity()->externalDataPath);
+	if (!iron_file_exists(start_arm)) {
+		start_arm = "./start.arm"; // Bundled in apk assets
+	}
+#endif
+
 	if (iron_file_exists(start_arm)) {
 		g_project->_->filepath = start_arm;
 		base_start_arm_found   = true;
@@ -580,9 +636,11 @@ void base_init() {
 	}
 
 	if (args_player) {
-		// base_player_lock = true;
-		g_config->workspace = WORKSPACE_PLAYER;
-		base_update_workspace();
+		base_player_lock = true;
+		base_player      = true;
+		ui_base_show     = false;
+		render_path_resize();
+		base_resize();
 		make_material_parse_paint_material(true);
 		sys_notify_on_next_frame(&base_init_on_start_arm, NULL);
 	}
@@ -608,32 +666,63 @@ i32 base_w() {
 		return 1;
 	}
 
-	i32 res = base_view3d_w();
+	i32 res = base_view_w();
 	return res > 0 ? res : 1; // App was minimized, force render path resize
 }
 
+// Width of the 3D view tab next to the toolbar
 i32 base_view3d_w() {
-	i32 res = 0;
-	if (g_config->layout == NULL) {
-		i32 sidebarw = ui_sidebar_default_w;
-		res          = iron_window_width() - sidebarw - ui_toolbar_default_w;
+	if (g_context->paint2d_view) {
+		return ui_view2d_ww;
 	}
-	else if (ui_nodes_show || ui_view2d_show) {
-		res = iron_window_width() - g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_W] - g_config->layout->buffer[LAYOUT_SIZE_NODES_W] - ui_toolbar_w(true);
-	}
-	else if (ui_base_show) {
-		res = iron_window_width() - g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_W] - ui_toolbar_w(true);
-	}
-	else { // Distract free
-		res = iron_window_width();
+	return ui_dock_view3d_w();
+}
+
+// Split view draws two 3D views next to each other, each one with its own toolbar and header
+bool base_is_split() {
+	return g_context->split_view && base_view3d_show;
+}
+
+// View being rendered, the view under the mouse cursor otherwise
+i32 base_view_index() {
+	if (!base_is_split()) {
+		return 0;
 	}
 	if (g_context->view_index > -1) {
-		res = math_ceil(res / 2.0);
+		return g_context->view_index;
 	}
-	if (g_context->paint2d_view) {
-		res = ui_view2d_ww;
+	return g_context->view_index_last > 0 ? 1 : 0;
+}
+
+// Toolbar docked next to each 3D view
+static i32 base_view_toolbar_w() {
+	return ui_base_show ? ui_toolbar_w(true) : 0;
+}
+
+i32 base_view_w() {
+	i32 res = base_view3d_w();
+	if (base_is_split()) {
+		res = math_floor((res - base_view_toolbar_w()) / 2.0);
 	}
 	return res;
+}
+
+i32 base_view_x(i32 view_index) {
+	return view_index == 1 ? base_appx + base_view3d_w() - base_view_w() : base_appx;
+}
+
+i32 base_view_at_mouse() {
+	if (!base_is_split()) {
+		return -1;
+	}
+	if (mouse_y >= base_appy && mouse_y < base_appy + base_h()) {
+		for (i32 i = 0; i < 2; ++i) {
+			if (mouse_x >= base_view_x(i) && mouse_x < base_view_x(i) + base_view_w()) {
+				return i;
+			}
+		}
+	}
+	return -1;
 }
 
 i32 base_h() {
@@ -647,34 +736,75 @@ i32 base_h() {
 		return util_render_decal_preview_size;
 	}
 
-	i32 res = iron_window_height();
-
-	if (g_config->layout == NULL) {
-		res -= ui_header_default_h * 2 + ui_statusbar_default_h;
-#if defined(IRON_ANDROID) || defined(IRON_IOS)
-		res += ui_header_h;
-#endif
-	}
-	else if (ui_base_show && res > 0) {
-		i32 statush = g_config->layout->buffer[LAYOUT_SIZE_STATUS_H];
-		res -= math_floor(ui_header_default_h * 2 * g_config->window_scale) + statush;
-
-		if (g_config->layout->buffer[LAYOUT_SIZE_HEADER] == 0) {
-			res += ui_header_h * 2;
-		}
-		if (!base_view3d_show) {
-			res += ui_header_h * 4;
-		}
+	// 2D view paints into the area below its header
+	i32 res = ui_dock_view3d_h();
+	if (g_context->paint2d_view || (!base_view3d_show && ui_view2d_show)) {
+		res = ui_view2d_wh - ui_view2d_top();
 	}
 
 	return res > 0 ? res : 1; // App was minimized, force render path resize
 }
 
+// The cursor hovering the 2D view is mapped the same way as while painting in it,
+// the stroke begins at the last hovered position
+bool base_paint_in_2d() {
+	// The brush inputs are read before the 2D view updates paint2d for the frame,
+	// keep the view the stroke was started in
+	static bool started_in_2d = false;
+	bool        in_2d         = context_in_2d_view(VIEW_2D_TYPE_LAYER);
+	if (mouse_started("left") || pen_started("tip")) {
+		started_in_2d = in_2d;
+	}
+	if (mouse_down("left") || pen_down("tip")) {
+		return g_context->paint2d || started_in_2d;
+	}
+	return in_2d;
+}
+
+// Paint coordinates are relative to the view being painted, the 2D view is a 3D view of the layer plane
+i32 base_paint_view_x() {
+	return base_paint_in_2d() ? ui_view2d_wx : base_x();
+}
+
+i32 base_paint_view_y() {
+	return base_paint_in_2d() ? ui_view2d_wy + ui_view2d_top() : base_y();
+}
+
+i32 base_paint_view_w() {
+	return base_paint_in_2d() ? ui_view2d_ww : base_w();
+}
+
+i32 base_paint_view_h() {
+	return base_paint_in_2d() ? ui_view2d_wh - ui_view2d_top() : base_h();
+}
+
+f32 base_paint_x(f32 screen_x) {
+	return (screen_x - base_paint_view_x()) / (f32)base_paint_view_w();
+}
+
+f32 base_paint_y(f32 screen_y) {
+	return (screen_y - base_paint_view_y()) / (f32)base_paint_view_h();
+}
+
+f32 base_paint_screen_x(f32 paint_x) {
+	return base_paint_view_x() + paint_x * base_paint_view_w();
+}
+
+f32 base_paint_screen_y(f32 paint_y) {
+	return base_paint_view_y() + paint_y * base_paint_view_h();
+}
+
 i32 base_x() {
-	return g_context->view_index == 1 ? base_appx + base_w() : base_appx;
+	if (g_context->paint2d_view) {
+		return ui_view2d_wx;
+	}
+	return base_view_x(base_view_index());
 }
 
 i32 base_y() {
+	if (g_context->paint2d_view) {
+		return ui_view2d_wy + ui_view2d_top();
+	}
 	return base_appy;
 }
 
@@ -683,14 +813,10 @@ void base_on_resize() {
 		return;
 	}
 
-	f32 ratio_w             = iron_window_width() / (float)base_last_window_width;
-	base_last_window_width  = iron_window_width();
-	f32 ratio_h             = iron_window_height() / (float)base_last_window_height;
-	base_last_window_height = iron_window_height();
-
-	g_config->layout->buffer[LAYOUT_SIZE_NODES_W]    = math_floor(g_config->layout->buffer[LAYOUT_SIZE_NODES_W] * ratio_w);
-	g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_H0] = math_floor(g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_H0] * ratio_h);
-	g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_H1] = iron_window_height() - g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_H0];
+	// Keep the nodes and 2D view in ratio
+	f32 ratio_w            = iron_window_width() / (float)base_last_window_width;
+	base_last_window_width = iron_window_width();
+	ui_dock_set_size(DOCK_ROLE_VIEWS, math_floor(ui_dock_get_size(DOCK_ROLE_VIEWS) * ratio_w));
 
 	base_resize();
 	base_save_window_rect();
@@ -700,6 +826,8 @@ void base_resize() {
 	if (iron_window_width() == 0 || iron_window_height() == 0) {
 		return;
 	}
+
+	ui_dock_layout();
 
 	camera_object_t *cam = scene_camera;
 	if (cam->data->ortho != NULL) {
@@ -715,77 +843,46 @@ void base_resize() {
 
 	g_context->ddirty = 2;
 
-	if (ui_base_show && base_view3d_show) {
-		base_appx = ui_toolbar_w(true);
-		base_appy = 0;
-		if (g_config->layout->buffer[LAYOUT_SIZE_HEADER] == 1) {
-			base_appy = ui_header_h * 2;
-		}
-	}
-	else {
-		base_appx = -1;
-		base_appy = 0;
-	}
-
-	ui_nodes_grid_redraw  = true;
-	ui_view2d_grid_redraw = true;
+	ui_nodes_grid_redraw = true;
 
 	base_redraw_ui();
 }
 
 string_array_t *base_combo_enum_texts(char *node_type) {
-	if (string_equals(node_type, "TEX_IMAGE")) {
-		if (g_project->_->assets->length > 0) {
-			string_array_t *asset_names = any_array_create_from_raw((void *[]){}, 0);
-			for (i32 i = 0; i < g_project->_->assets->length; ++i) {
-				any_array_push(asset_names, g_project->_->assets->buffer[i]->name);
-			}
-			return asset_names;
+	static string_array_t texts = {0};
+	texts.length                = 0;
+
+	if (string_equals(node_type, "TEX_IMAGE") || string_equals(node_type, "image_texture_node")) {
+		for (i32 i = 0; i < g_project->_->assets->length; ++i) {
+			string_array_push(&texts, g_project->_->assets->buffer[i]->name);
 		}
-		else {
-			string_array_t *empty = any_array_create_from_raw(
-			    (void *[]){
-			        "",
-			    },
-			    1);
-			return empty;
+		if (texts.length == 0) {
+			string_array_push(&texts, "");
 		}
+		return &texts;
 	}
 
-	if (string_equals(node_type, "LAYER") || string_equals(node_type, "LAYER_MASK")) {
-		string_array_t *layer_names = any_array_create_from_raw((void *[]){}, 0);
+	if (string_equals(node_type, "LAYER") || string_equals(node_type, "LAYER_MASK") || string_equals(node_type, "MESH_DISPLACE")) {
 		for (i32 i = 0; i < g_project->_->layers->length; ++i) {
 			slot_layer_t *l = g_project->_->layers->buffer[i];
-			any_array_push(layer_names, l->name);
+			string_array_push(&texts, l->name);
 		}
-		return layer_names;
+		return &texts;
 	}
 
 	if (string_equals(node_type, "MATERIAL")) {
-		string_array_t *material_names = any_array_create_from_raw((void *[]){}, 0);
 		for (i32 i = 0; i < g_project->_->materials->length; ++i) {
 			slot_material_t *m = g_project->_->materials->buffer[i];
-			any_array_push(material_names, m->canvas->name);
+			string_array_push(&texts, m->canvas->name);
 		}
-		return material_names;
+		return &texts;
 	}
 
-	if (string_equals(node_type, "image_texture_node")) {
-		if (g_project->_->assets->length > 0) {
-			string_array_t *asset_names = any_array_create_from_raw((void *[]){}, 0);
-			for (i32 i = 0; i < g_project->_->assets->length; ++i) {
-				any_array_push(asset_names, g_project->_->assets->buffer[i]->name);
-			}
-			return asset_names;
+	if (string_equals(node_type, "MESH_OBJECT")) {
+		for (i32 i = 0; i < g_project->_->paint_objects->length; ++i) {
+			string_array_push(&texts, g_project->_->paint_objects->buffer[i]->base->name);
 		}
-		else {
-			string_array_t *empty = any_array_create_from_raw(
-			    (void *[]){
-			        "",
-			    },
-			    1);
-			return empty;
-		}
+		return &texts;
 	}
 
 	return NULL;
@@ -802,7 +899,7 @@ any_array_t *base_combo_enum_textures(char *node_type) {
 		return ar;
 	}
 
-	if (string_equals(node_type, "LAYER") || string_equals(node_type, "LAYER_MASK")) {
+	if (string_equals(node_type, "LAYER") || string_equals(node_type, "LAYER_MASK") || string_equals(node_type, "MESH_DISPLACE")) {
 		any_array_t *ar = any_array_create(0);
 		for (i32 i = 0; i < g_project->_->layers->length; ++i) {
 			slot_layer_t *l = g_project->_->layers->buffer[i];
@@ -864,112 +961,122 @@ bool base_is_decal_layer() {
 }
 
 void base_redraw_status() {
-	ui_base_hwnds->buffer[TAB_AREA_STATUS]->redraws = 2;
+	ui_dock_redraw(TAB_AREA_STATUS);
 }
 
 void base_redraw_console() {
-	ui_base_hwnds->buffer[TAB_AREA_STATUS]->redraws = 2;
+	ui_dock_redraw(TAB_AREA_STATUS);
 }
 
 void base_redraw_ui() {
-	ui_header_handle->redraws                       = 2;
-	ui_base_hwnds->buffer[TAB_AREA_STATUS]->redraws = 2;
-	ui_menubar_menu_handle->redraws                 = 2;
-	ui_menubar_hwnd->redraws                        = 2;
-	ui_nodes_hwnd->redraws                          = 2;
-	ui_box_hwnd->redraws                            = 2;
-	ui_view2d_hwnd->redraws                         = 2;
+	ui_header_handle->redraws       = 2;
+	ui_menubar_menu_handle->redraws = 2;
+	ui_menubar_hwnd->redraws        = 2;
+	ui_nodes_hwnd->redraws          = 2;
+	ui_box_hwnd->redraws            = 2;
+	ui_view2d_hwnd->redraws         = 2;
+	ui_toolbar_handle->redraws      = 2;
+	ui_dock_redraw(-1);
 	// Redraw viewport
 	if (g_context->ddirty < 0) {
 		g_context->ddirty = 0;
 	}
-	ui_base_hwnds->buffer[TAB_AREA_SIDEBAR0]->redraws = 2;
-	ui_base_hwnds->buffer[TAB_AREA_SIDEBAR1]->redraws = 2;
-	ui_toolbar_handle->redraws                        = 2;
 	if (g_context->split_view) {
 		g_context->ddirty = 1;
 	}
 }
 
-void base_update_workspace() {
-	config_init_layout();
+// Tabs are docked anew once the windows of the frame are done
+void base_set_workspace(workspace_preset_t preset) {
+	base_workspace_preset  = preset;
+	base_workspace_pending = true;
+}
 
-	if (g_config->workspace == WORKSPACE_PAINT_3D) {
-		base_view3d_show  = true;
-		ui_menubar_tab->i = 0;
-		ui_view2d_show    = false;
-		ui_nodes_show     = false;
-	}
-	else if (g_config->workspace == WORKSPACE_PAINT_2D) {
-		base_view3d_show  = false;
-		ui_menubar_tab->i = -1;
-		ui_view2d_show    = true;
-		ui_nodes_show     = false;
-	}
-	else if (g_config->workspace == WORKSPACE_NODES) {
-		base_view3d_show  = false;
-		ui_menubar_tab->i = -1;
-		ui_view2d_show    = false;
-		ui_nodes_show     = true;
+void base_apply_workspace() {
+	base_workspace_pending    = false;
+	workspace_preset_t preset = base_workspace_preset;
 
+	if (preset == WORKSPACE_PRESET_NONE) {
+		ui_dock_load();
+		base_resize();
+		return;
+	}
+
+	// Reset the layout to the preset
+	ui_dock_set_preset(true);
+	ui_dock_reset();
+
+	if (preset == WORKSPACE_PRESET_VIEW_2D) {
+		ui_dock_show_view(TAB_VIEW3D, false);
+		ui_dock_show_view(TAB_VIEW2D, true);
+	}
+	else if (preset == WORKSPACE_PRESET_NODES) {
+		ui_dock_show_view(TAB_VIEW3D, false);
+		ui_dock_show_view(TAB_NODES, true);
 		ui_sidebar_show(false);
 	}
-	else if (g_config->workspace == WORKSPACE_SCRIPT) {
-		base_view3d_show  = true;
-		ui_menubar_tab->i = 0;
-		ui_view2d_show    = false;
-		ui_nodes_show     = false;
+	else if (preset == WORKSPACE_PRESET_SCRIPT) {
+		ui_base_show_tab(TAB_CONSOLE);
+		ui_base_show_tab(TAB_SCRIPTS);
 
-		ui_base_htabs->buffer[TAB_AREA_STATUS]->i        = 5; // Console
-		g_config->layout_tabs->buffer[TAB_AREA_STATUS]   = 5;
-		ui_base_htabs->buffer[TAB_AREA_SIDEBAR0]->i      = 2; // Script
-		g_config->layout_tabs->buffer[TAB_AREA_SIDEBAR0] = 2;
-
-		g_config->layout->buffer[LAYOUT_SIZE_STATUS_H]  = iron_window_height() * 0.2;
-		g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_W] = iron_window_width() * 0.52;
-		float h                                         = UI_ELEMENT_H() + UI_ELEMENT_OFFSET() + 2;
+		ui_dock_set_size(DOCK_ROLE_STATUS, math_floor(iron_window_height() * 0.2));
+		ui_dock_set_size(DOCK_ROLE_SIDEBAR, math_floor(iron_window_width() * 0.52));
+		float h = UI_ELEMENT_H() + UI_ELEMENT_OFFSET() + 2;
 		h += UI_ELEMENT_H() * 3.5; // Small material panel
-		g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_H0] = iron_window_height() - h;
-		g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_H1] = h;
-		render_path_resize();
-	}
-	else if (g_config->workspace == WORKSPACE_PLAYER) {
-		ui_base_show = false;
+		ui_dock_set_size(DOCK_ROLE_SIDEBAR_INNER, 1.0 - h / (f32)iron_window_height());
 		render_path_resize();
 	}
 
+	g_config->header_pinned = !g_config->touch_ui;
 	if (g_config->touch_ui) {
-		g_config->layout->buffer[LAYOUT_SIZE_HEADER] = 0;
-		if (g_config->workspace == WORKSPACE_PAINT_2D || g_config->workspace == WORKSPACE_PAINT_3D) {
-			ui_sidebar_show(true);
-			g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_W] = ui_sidebar_default_w_mini;
-			g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_W] = math_floor(g_config->layout->buffer[LAYOUT_SIZE_SIDEBAR_W] * UI_SCALE());
+		if (preset == WORKSPACE_PRESET_VIEW_2D || preset == WORKSPACE_PRESET_VIEW_3D) {
+			ui_dock_set_size(DOCK_ROLE_SIDEBAR, math_floor(ui_base_sidebar_mini_w(g_config->large_asset_previews) * UI_SCALE()));
 		}
 	}
+	ui_dock_set_preset(false);
 
 	base_resize();
+	ui_dock_save();
 }
 
-void base_update_workflow_create_sculpt_layer(void *_) {
+void base_update_tools_create_sculpt_layer(void *_) {
 	if (history_undo_layers != NULL) {
 		sculpt_layers_create_sculpt_layer();
-		sys_remove_update(base_update_workflow_create_sculpt_layer);
+		sys_remove_update(base_update_tools_create_sculpt_layer);
 	}
 }
 
-void base_update_workflow() {
+void base_update_tools_nodes() {
 	// Update Material Output nodes
+	bool pbr = g_config->tools != TOOLS_SCULPT;
 	for (i32 i = 0; i < g_project->_->materials->length; ++i) {
 		ui_node_array_t *nodes = g_project->_->materials->buffer[i]->canvas->nodes;
 		for (i32 j = 0; j < nodes->length; ++j) {
 			if (string_equals(nodes->buffer[j]->type, "OUTPUT_MATERIAL_PBR")) {
-				nodes->buffer[j]->inputs->length          = g_config->workflow == WORKFLOW_PBR ? 9 : 2;
-				nodes->buffer[j]->inputs->buffer[0]->name = g_config->workflow == WORKFLOW_SCULPT ? tr("Displacement") : tr("Base Color");
+				nodes->buffer[j]->inputs->length          = pbr ? 9 : 2;
+				nodes->buffer[j]->inputs->buffer[0]->name = g_config->tools == TOOLS_SCULPT ? tr("Displacement") : tr("Base Color");
 			}
 		}
 	}
+}
 
-	if (g_config->workflow == WORKFLOW_SCULPT) {
+void base_update_tools() {
+	base_update_tools_nodes();
+	if (ui_toolbar_handle != NULL) {
+		ui_toolbar_handle->redraws = 2;
+	}
+
+	if (g_config->tools == TOOLS_OBJECT) {
+		context_select_tool(TOOL_TYPE_CURSOR);
+	}
+	else if (util_tool_is_object_tool(g_context->tool)) {
+		context_select_tool(TOOL_TYPE_BRUSH);
+	}
+
+	if (g_config->tools == TOOLS_SCULPT) {
+		if (g_context->tool != TOOL_TYPE_BRUSH && !ui_toolbar_tool_visible(g_context->tool)) {
+			context_select_tool(TOOL_TYPE_BRUSH);
+		}
 		slot_layer_t *first_sculpt = NULL;
 		for (i32 i = g_project->_->layers->length - 1; i >= 0; --i) {
 			if (g_project->_->layers->buffer[i]->texpaint_sculpt != NULL) {
@@ -978,8 +1085,8 @@ void base_update_workflow() {
 			}
 		}
 		if (first_sculpt == NULL) {
-			sys_remove_update(base_update_workflow_create_sculpt_layer);
-			sys_notify_on_update(base_update_workflow_create_sculpt_layer, NULL);
+			sys_remove_update(base_update_tools_create_sculpt_layer);
+			sys_notify_on_update(base_update_tools_create_sculpt_layer, NULL);
 		}
 		else {
 			context_set_layer(first_sculpt);
@@ -996,16 +1103,50 @@ void base_update_workflow() {
 	}
 }
 
+static void base_run_in_player_export(char *path) {
+	gpu_texture_t *current = _draw_current;
+	bool           in_use  = gpu_in_use;
+	if (in_use)
+		draw_end();
+	export_arm_run_project(path);
+	if (in_use)
+		draw_begin(current, false, 0);
+}
+
 void base_run_in_player() {
+#ifdef IRON_WASM
+	iron_delete_file("/player/start.arm");
+	iron_load_url("/?player");
+	base_run_in_player_export("/player/start.arm");
+	return;
+#endif
+
 	if (string_equals(g_project->_->filepath, "")) {
 		console_error(tr("Save project first"));
 		return;
 	}
-	export_arm_run_project();
+	base_run_in_player_export(g_project->_->filepath);
 	char *bin = iron_get_arg(0);
-	iron_sys_command(string("%s %s --player", bin, g_project->_->filepath));
-	// iron_exec_async()
+	iron_sys_command(string("\"%s\" \"%s\" --player", bin, g_project->_->filepath));
 }
+
+#ifdef IRON_WASM
+void base_share_player() {
+	if (!box_projects_is_cloud_path(g_project->_->filepath)) {
+		console_error(tr("Save the project to the cloud first"));
+		return;
+	}
+	iron_delete_file("/share/start.arm");
+	iron_load_url(string("/share.html?slot=%d", box_projects_cloud_slot(g_project->_->filepath)));
+	gpu_texture_t *current = _draw_current;
+	bool           in_use  = gpu_in_use;
+	if (in_use)
+		draw_end();
+	export_arm_run_project("/share/start.arm");
+	if (in_use)
+		draw_begin(current, false, 0);
+}
+#endif
 
 uint32_t base_darker(uint32_t x, uint32_t y) {
 	uint32_t r  = ((x >> 16) & 0xff);
@@ -1035,11 +1176,12 @@ string_array_t *base_get_viewport_modes() {
 	        tr("Subsurface"),
 	        tr("TexCoord"),
 	        tr("Object Normal"),
+	        tr("World Normal"),
 	        tr("Material ID"),
 	        tr("Object ID"),
 	        tr("Mask"),
 	    },
-	    15);
+	    16);
 
 	if (gpu_raytrace_supported()) {
 		any_array_push(modes, tr("Path Traced"));
@@ -1063,11 +1205,12 @@ string_array_t *base_get_viewport_mode_shortcuts() {
 	        "s",
 	        "t",
 	        "1",
+	        "w",
 	        "2",
 	        "3",
 	        "4",
 	    },
-	    15);
+	    16);
 
 	if (gpu_raytrace_supported()) {
 		any_array_push(shortcuts, "p");

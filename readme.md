@@ -52,12 +52,6 @@ cd armorpaint/paint
 ../base/make --target wasm --compile --embed
 ```
 
-**Generating a locale file**
-```bash
-./base/make --js base/tools/extract_locales.js <locale code>
-# Generates a `paint/assets/locale/<locale code>.json` file
-```
-
 **Embedding data files**
 ```bash
 # Requires compiler with c23 #embed support (clang 19 or newer)

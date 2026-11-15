@@ -33,7 +33,7 @@ static bool               mouse_hidden = false;
 static int                xi_extension = -1;
 static Atom               XdndAware;
 static Atom               XdndDrop;
-static Atom               XdndEnter;
+static Atom               XdndPosition;
 static Atom               XdndTextUriList;
 static Atom               XdndStatus;
 static Atom               XdndActionCopy;
@@ -75,7 +75,7 @@ void iron_x11_init() {
 
 	XdndAware               = XInternAtom(x11_ctx.display, "XdndAware", False);
 	XdndDrop                = XInternAtom(x11_ctx.display, "XdndDrop", False);
-	XdndEnter               = XInternAtom(x11_ctx.display, "XdndEnter", False);
+	XdndPosition            = XInternAtom(x11_ctx.display, "XdndPosition", False);
 	XdndTextUriList         = XInternAtom(x11_ctx.display, "text/uri-list", False);
 	XdndStatus              = XInternAtom(x11_ctx.display, "XdndStatus", False);
 	XdndActionCopy          = XInternAtom(x11_ctx.display, "XdndActionCopy", False);
@@ -145,6 +145,9 @@ void iron_display_init() {
 	}
 
 	iron_x11_init();
+	if (x11_ctx.display == NULL) {
+		return;
+	}
 
 	Window              root_window      = RootWindow(x11_ctx.display, DefaultScreen(x11_ctx.display));
 	XRRScreenResources *screen_resources = XRRGetScreenResourcesCurrent(x11_ctx.display, root_window);
@@ -498,6 +501,8 @@ static int xk_to_iron(KeySym symbol) {
 		return KEY_CODE_BACKSPACE;
 	if (symbol == XK_Tab)
 		return KEY_CODE_TAB;
+	if (symbol == XK_ISO_Left_Tab)
+		return KEY_CODE_TAB; // Shift+Tab
 	if (symbol == XK_Return)
 		return KEY_CODE_RETURN;
 	if (symbol == XK_Shift_L)
@@ -749,10 +754,8 @@ static int xk_to_iron(KeySym symbol) {
 	return KEY_CODE_UNKNOWN;
 }
 
-void *gc_alloc(size_t size);
-
 static char *uri_decode(const char *src) {
-	char *res = gc_alloc(1024);
+	char *res = calloc(1, 1024);
 	char *dst = res;
 	char  a, b;
 	while (*src) {
@@ -840,15 +843,11 @@ static bool _handle_messages() {
 			}
 			else if (controlDown && (ksKey == XK_c || ksKey == XK_C)) {
 				XSetSelectionOwner(x11_ctx.display, CLIPBOARD, window, CurrentTime);
-				char *text = iron_internal_copy_callback();
-				if (text != NULL)
-					iron_copy_to_clipboard(text);
+				iron_internal_copy_callback();
 			}
 			else if (controlDown && (ksKey == XK_x || ksKey == XK_X)) {
 				XSetSelectionOwner(x11_ctx.display, CLIPBOARD, window, CurrentTime);
-				char *text = iron_internal_cut_callback();
-				if (text != NULL)
-					iron_copy_to_clipboard(text);
+				iron_internal_cut_callback();
 			}
 
 			if (event.xkey.keycode == ignoreKeycode) {
@@ -975,7 +974,7 @@ static bool _handle_messages() {
 			break;
 		}
 		case ClientMessage: {
-			if (event.xclient.message_type == XdndEnter) {
+			if (event.xclient.message_type == XdndPosition) {
 				Window source_window = event.xclient.data.l[0];
 				XEvent m;
 				memset(&m, 0, sizeof(m));
@@ -1195,11 +1194,14 @@ void iron_init(iron_window_options_t *ops) {
 	iron_window_create(ops);
 }
 
+void gpu_destroy(void);
+
 void iron_internal_shutdown() {
 #ifdef WITH_GAMEPAD
 	iron_linux_closeHIDGamepads();
 #endif
 	free(clipboardString);
+	gpu_destroy();
 	XCloseDisplay(x11_ctx.display);
 	iron_internal_shutdown_callback();
 }
@@ -1216,6 +1218,10 @@ void iron_copy_to_clipboard(const char *text) {
 		clipboardString     = (char *)malloc(clipboardStringSize);
 	}
 	strcpy(clipboardString, text);
+
+	struct iron_x11_window *window = &x11_ctx.windows[0];
+	XSetSelectionOwner(x11_ctx.display, CLIPBOARD, window->window, CurrentTime);
+	XFlush(x11_ctx.display);
 }
 
 int iron_hardware_threads(void) {
@@ -1489,9 +1495,10 @@ void iron_gamepad_rumble(int gamepad, float left, float right) {}
 
 #endif
 
+extern void (*iron_save_and_quit)(bool);
+
 #ifdef WITH_NFD // Has gtk
 #include <gtk/gtk.h>
-extern void (*iron_save_and_quit)(bool);
 static bool iron_gtk_setlocale_disabled = false;
 void        iron_gtk_disable_setlocale() {
     if (iron_gtk_setlocale_disabled) {
@@ -1503,8 +1510,8 @@ void        iron_gtk_disable_setlocale() {
 #endif
 
 bool _save_and_quit_callback_internal() {
+	bool save = false;
 #ifdef WITH_NFD // Has gtk
-	bool          save = false;
 	XTextProperty text_prop;
 	XGetTextProperty(x11_ctx.display, x11_ctx.windows[0].window, &text_prop, NET_WM_NAME);
 	char *title = (char *)text_prop.value;
@@ -1531,13 +1538,14 @@ bool _save_and_quit_callback_internal() {
 			return false;
 		}
 	}
-	iron_save_and_quit(save);
 #endif
+	iron_save_and_quit(save);
 	return false;
 }
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 static pid_t child_pid                   = -1;
 volatile int iron_exec_async_done        = 1;
@@ -1552,15 +1560,33 @@ void iron_exec_handler(int sig) {
 
 void iron_exec_async(const char *path, char *argv[]) {
 	iron_exec_async_done = 0;
+	pid_t parent_pid     = getpid();
 	child_pid            = fork();
 	if (child_pid == 0) {
-		if (iron_exec_async_output_file != NULL) {
-			int fd = open(iron_exec_async_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			dup2(fd, STDOUT_FILENO);
+		prctl(PR_SET_PDEATHSIG, SIGTERM);
+		if (getppid() != parent_pid) {
+			_exit(1);
+		}
+		int fd = iron_exec_async_output_file != NULL ? open(iron_exec_async_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open("/dev/null", O_WRONLY);
+		dup2(fd, STDOUT_FILENO);
+		dup2(fd, STDERR_FILENO);
+		if (fd > STDERR_FILENO) {
 			close(fd);
 		}
-		execve(path, argv, NULL);
-		exit(1);
+		int in_fd = open("/dev/null", O_RDONLY);
+		dup2(in_fd, STDIN_FILENO);
+		if (in_fd > STDERR_FILENO) {
+			close(in_fd);
+		}
+		char *home = getenv("HOME");
+		char *env  = getenv("PATH");
+		if (home != NULL) {
+			char new_path[4096];
+			snprintf(new_path, sizeof(new_path), "%s/.local/bin:%s/bin:%s", home, home, env);
+			setenv("PATH", new_path, 1);
+		}
+		execvp(path, argv);
+		_exit(1);
 	}
 	else {
 		struct sigaction sa = {0};

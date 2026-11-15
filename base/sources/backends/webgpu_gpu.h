@@ -1,6 +1,8 @@
 #pragma once
 #include "webgpu.h"
 
+#define GPU_RAYTRACE_MAX_OBJECTS 64
+
 typedef struct {
 	WGPUBuffer buf;
 	void      *mem;
@@ -15,9 +17,9 @@ typedef struct {
 
 typedef struct {
 	WGPURenderPipeline pipeline;
-	WGPURenderPipeline pipeline_depth;
+	WGPURenderPipeline pipeline_unfilterable;
 	WGPUPipelineLayout pipeline_layout;
-	WGPUPipelineLayout pipeline_layout_depth;
+	WGPUPipelineLayout pipeline_layout_unfilterable;
 } gpu_pipeline_impl_t;
 
 typedef struct {

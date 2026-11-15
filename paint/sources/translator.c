@@ -10,6 +10,21 @@ bool       _translator_init_font_cjk;
 char      *_translator_init_font_font_path;
 f32        _translator_init_font_font_scale;
 
+// Locale files keep each string on a single line, with newlines stored as "\n" and backslashes as "\\"
+static void translator_unescape_line(char *s) {
+	i32 length = 0;
+	for (i32 i = 0; s[i] != '\0'; ++i) {
+		if (s[i] == '\\' && s[i + 1] != '\0') {
+			++i;
+			s[length++] = s[i] == 'n' ? '\n' : s[i];
+		}
+		else if (s[i] != '\r') {
+			s[length++] = s[i];
+		}
+	}
+	s[length] = '\0';
+}
+
 // Mark strings as localizable in order to be parsed by the extract_locale script
 // The string will not be translated to the currently selected locale though
 char *_tr(char *s) {
@@ -19,27 +34,24 @@ char *_tr(char *s) {
 // Localizes a string with the given placeholders replaced (format is "{placeholder_name}")
 // If the string isn't available in the translation, this method will return the source English string
 char *vtr(char *id, any_map_t *vars) {
-	char *translation = string_copy(id);
+	char *translation = id;
 
 	// English is the source language
 	if (!string_equals(g_config->locale, "en")) {
-		if (string_index_of(id, "\n") > -1) {
-			id = string_copy(string_replace_all(id, "\n", "\\n"));
-		}
 		char *s = any_map_get(translator_translations, id);
 		if (s != NULL) {
-			if (string_index_of(s, "\\n") > -1) {
-				s = string_copy(string_replace_all(s, "\\n", "\n"));
-			}
-			translation = string_copy(s);
+			translation = s;
 		}
 	}
 
 	if (vars != NULL) {
-		string_array_t *keys = map_keys(vars);
-		for (i32 i = 0; i < keys->length; ++i) {
-			char *search = string("{%s}", keys->buffer[i]);
-			translation  = string_copy(string_replace_all(translation, search, any_map_get(vars, keys->buffer[i])));
+		string_array_t *keys = vars->keys;
+		for (i32 i = 0; i < keys->capacity; ++i) {
+			char *k = keys->buffer[i];
+			if (k == NULL) {
+				continue;
+			}
+			translation = string_replace_all_tmp(translation, string_tmp("{%s}", k), any_map_get(vars, k));
 		}
 	}
 
@@ -62,9 +74,7 @@ void translator_init_font_on_next_frame(void *_) {
 		f->glyphs_version = 0;
 		draw_font_init(f);
 	}
-	gc_unroot(g_font);
 	g_font = f;
-	gc_root(g_font);
 
 	// Scale up the font size and elements width a bit
 	g_theme->FONT_SIZE = math_floor(base_default_font_size * font_scale);
@@ -75,10 +85,8 @@ void translator_init_font_on_next_frame(void *_) {
 }
 
 void translator_init_font(bool cjk, char *font_path, f32 font_scale) {
-	_translator_init_font_cjk = cjk;
-	gc_unroot(_translator_init_font_font_path);
-	_translator_init_font_font_path = string_copy(font_path);
-	gc_root(_translator_init_font_font_path);
+	_translator_init_font_cjk        = cjk;
+	_translator_init_font_font_path  = string_copy(font_path);
 	_translator_init_font_font_scale = font_scale;
 
 	// Load and assign font with cjk characters
@@ -103,9 +111,7 @@ void translator_load_translations_on_cjk_downloaded(char *url) {
 		// Fall back to English
 		g_config->locale = "en";
 		translator_extended_glyphs();
-		gc_unroot(translator_translations);
 		translator_translations = any_map_create();
-		gc_root(translator_translations);
 		translator_init_font(false, "font.ttf", 1.0);
 	}
 	else {
@@ -117,9 +123,7 @@ void translator_load_translations_on_cjk_downloaded(char *url) {
 void translator_load_translations(char *new_locale) {
 
 	if (translator_cjk_font_indices == NULL) {
-		gc_unroot(translator_cjk_font_indices);
 		translator_cjk_font_indices = i32_map_create();
-		gc_root(translator_cjk_font_indices);
 		i32_map_set(translator_cjk_font_indices, "ja", 0);
 		i32_map_set(translator_cjk_font_indices, "ko", 1);
 		i32_map_set(translator_cjk_font_indices, "zh_cn", 2);
@@ -139,25 +143,35 @@ void translator_load_translations(char *new_locale) {
 
 	// No translations to load, as source strings are in English
 	// Clear existing translations if switching languages at runtime
-	gc_unroot(translator_translations);
 	translator_translations = any_map_create();
-	gc_root(translator_translations);
 
 	if (string_equals(g_config->locale, "en") && string_equals(translator_last_locale, "en")) {
 		// No need to generate extended font atlas for English locale
 		return;
 	}
 
-	gc_unroot(translator_last_locale);
 	translator_last_locale = string_copy(g_config->locale);
-	gc_root(translator_last_locale);
 
 	if (!string_equals(g_config->locale, "en")) {
-		// Load the translation file
-		char *translation_json = sys_buffer_to_string(iron_load_blob(string("data/locale/%s.json", g_config->locale)));
-		gc_unroot(translator_translations);
-		translator_translations = json_parse_to_map(translation_json);
-		gc_root(translator_translations);
+		// Load the translation file, each line translates the same line of the source strings in en.txt
+		any_array_t *ids          = string_split(sys_buffer_to_string(iron_load_blob("data/locale/en.txt")), "\n");
+		any_array_t *translations = string_split(sys_buffer_to_string(iron_load_blob(string("data/locale/%s.txt", g_config->locale))), "\n");
+		for (i32 i = 0; i < ids->length; ++i) {
+			char *id          = ids->buffer[i];
+			char *translation = i < translations->length ? translations->buffer[i] : "";
+			translator_unescape_line(id);
+			translator_unescape_line(translation);
+			// Not translated yet, tr() falls back to the source string
+			if (id[0] == '\0' || translation[0] == '\0') {
+				continue;
+			}
+			// The map keeps the strings
+			any_map_set(translator_translations, id, translation);
+		}
+		array_free(ids);
+		free(ids);
+		array_free(translations);
+		free(translations);
 	}
 
 	// Generate extended font atlas
@@ -181,30 +195,20 @@ void translator_load_translations(char *new_locale) {
 			}
 		}
 	}
+	array_free(keys);
+	free(keys);
 
 	if (cjk) {
 		if (path_is_protected()) {
-			gc_unroot(_translator_load_translations_cjk_font_path);
-			_translator_load_translations_cjk_font_path = string_copy(iron_internal_save_path());
-			gc_root(_translator_load_translations_cjk_font_path);
-			gc_unroot(_translator_load_translations_cjk_font_disk_path);
+			_translator_load_translations_cjk_font_path      = string_copy(iron_internal_save_path());
 			_translator_load_translations_cjk_font_disk_path = string_copy(iron_internal_save_path());
-			gc_root(_translator_load_translations_cjk_font_disk_path);
 		}
 		else {
-			gc_unroot(_translator_load_translations_cjk_font_path);
-			_translator_load_translations_cjk_font_path = "";
-			gc_root(_translator_load_translations_cjk_font_path);
-			gc_unroot(_translator_load_translations_cjk_font_disk_path);
+			_translator_load_translations_cjk_font_path      = "";
 			_translator_load_translations_cjk_font_disk_path = string("%s%s", path_data(), PATH_SEP);
-			gc_root(_translator_load_translations_cjk_font_disk_path);
 		}
-		gc_unroot(_translator_load_translations_cjk_font_path);
-		_translator_load_translations_cjk_font_path = string("%sfont_cjk.ttc", _translator_load_translations_cjk_font_path);
-		gc_root(_translator_load_translations_cjk_font_path);
-		gc_unroot(_translator_load_translations_cjk_font_disk_path);
+		_translator_load_translations_cjk_font_path      = string("%sfont_cjk.ttc", _translator_load_translations_cjk_font_path);
 		_translator_load_translations_cjk_font_disk_path = string("%sfont_cjk.ttc", _translator_load_translations_cjk_font_disk_path);
-		gc_root(_translator_load_translations_cjk_font_disk_path);
 
 		if (!iron_file_exists(_translator_load_translations_cjk_font_disk_path)) {
 			file_download_to("https://github.com/armory3d/armorbase/raw/main/Assets/common/extra/font_cjk.ttc",
@@ -230,8 +234,12 @@ string_array_t *translator_get_supported_locales() {
 	string_array_t *files = file_read_directory(string("%s%slocale", path_data(), PATH_SEP));
 	for (i32 i = 0; i < files->length; ++i) {
 		char *locale_filename = files->buffer[i];
-		// Trim the ".json" file extension from file names
-		any_array_push(locales, substring(locale_filename, 0, string_length(locale_filename) - 5));
+		// Skip the source strings
+		if (!ends_with(locale_filename, ".txt") || string_equals(locale_filename, "en.txt")) {
+			continue;
+		}
+		// Trim the ".txt" file extension from file names
+		any_array_push(locales, substring(locale_filename, 0, string_length(locale_filename) - 4));
 	}
 	return locales;
 }

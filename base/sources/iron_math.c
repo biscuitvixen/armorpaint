@@ -1,6 +1,6 @@
 
 #include "iron_math.h"
-#include "iron_gc.h"
+#include "iron_alloc.h"
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
@@ -52,7 +52,8 @@ int64_t iron_random_get(void) {
 }
 
 int64_t iron_random_get_max(int64_t max) {
-	return iron_random_get() % (max + 1);
+	int64_t value = iron_random_get();
+	return (value < -LLONG_MAX ? LLONG_MAX : llabs(value)) % (max + 1);
 }
 
 int64_t iron_random_get_in(int64_t min, int64_t max) {
@@ -645,7 +646,8 @@ mat4_decomposed_t *mat4_decompose(mat4_t m) {
 	m.m[10] *= invs;
 	rot = quat_from_rot_mat(m);
 
-	mat4_decomposed_t *dec = gc_alloc(sizeof(mat4_decomposed_t));
+	// Frame temporary..
+	mat4_decomposed_t *dec = (mat4_decomposed_t *)string_tmp_alloc(sizeof(mat4_decomposed_t));
 	dec->loc               = loc;
 	dec->rot               = rot;
 	dec->scl               = scl;
@@ -945,8 +947,8 @@ vec4_t mat4_get_loc(mat4_t m) {
 }
 
 vec4_t mat4_get_scale(mat4_t m) {
-	return (vec4_t){sqrtf(m.m[0] * m.m[0] + m.m[4] * m.m[4] + m.m[8] * m.m[8]), sqrtf(m.m[1] * m.m[1] + m.m[5] * m.m[5] + m.m[9] * m.m[9]),
-	                sqrtf(m.m[2] * m.m[2] + m.m[6] * m.m[6] + m.m[10] * m.m[10]), 1.0};
+	return (vec4_t){sqrtf(m.m[0] * m.m[0] + m.m[1] * m.m[1] + m.m[2] * m.m[2]), sqrtf(m.m[4] * m.m[4] + m.m[5] * m.m[5] + m.m[6] * m.m[6]),
+	                sqrtf(m.m[8] * m.m[8] + m.m[9] * m.m[9] + m.m[10] * m.m[10]), 1.0};
 }
 
 mat4_t mat4_mult(mat4_t m, float s) {

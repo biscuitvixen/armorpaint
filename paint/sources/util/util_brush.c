@@ -1,15 +1,20 @@
 
 #include "../global.h"
 
+static bool util_brush_clone_source_down = false;
+
 void util_brush_update() {
+	bool paint_down = keymap_shortcut(any_map_get(g_keymap, "action_paint"), SHORTCUT_TYPE_DOWN);
+
 	bool set_clone_source =
 	    g_context->tool == TOOL_TYPE_CLONE &&
-	    operator_shortcut(string("%s+%s", any_map_get(g_keymap, "set_clone_source"), any_map_get(g_keymap, "action_paint")), SHORTCUT_TYPE_DOWN);
+	    (keymap_shortcut(string_tmp("%s+%s", any_map_get(g_keymap, "set_clone_source"), any_map_get(g_keymap, "action_paint")), SHORTCUT_TYPE_DOWN) ||
+	     (g_context->clone_set_source && (paint_down || pen_down("tip"))));
 
 	bool decal_mask = context_is_decal_mask_paint();
 
-	bool down = operator_shortcut(any_map_get(g_keymap, "action_paint"), SHORTCUT_TYPE_DOWN) || decal_mask || set_clone_source ||
-	            operator_shortcut(string("%s+%s", any_map_get(g_keymap, "brush_ruler"), any_map_get(g_keymap, "action_paint")), SHORTCUT_TYPE_DOWN) ||
+	bool down = paint_down || decal_mask || set_clone_source ||
+	            keymap_shortcut(string_tmp("%s+%s", any_map_get(g_keymap, "brush_ruler"), any_map_get(g_keymap, "action_paint")), SHORTCUT_TYPE_DOWN) ||
 	            (pen_down("tip") && !keyboard_down("alt"));
 
 	if (g_config->touch_ui) {
@@ -25,49 +30,56 @@ void util_brush_update() {
 		down = false;
 	}
 
-	if (g_context->tool == TOOL_TYPE_SELECT) {
+	if (g_context->tool == TOOL_TYPE_SELECT || util_tool_is_object_tool(g_context->tool)) {
 		down = false;
 	}
 
 	if (down) {
-		i32 mx = mouse_view_x();
-		i32 my = mouse_view_y();
-		i32 ww = sys_w();
+		i32 mx = mouse_x - base_paint_view_x();
+		i32 my = mouse_y - base_paint_view_y();
+		i32 ww = base_paint_view_w();
+		i32 wh = base_paint_view_h();
 
-		if (g_context->paint2d) {
-			mx -= sys_w();
-			ww = ui_view2d_ww;
-		}
-
-		if (mx < ww && mx > sys_x() && my < sys_h() && my > sys_y()) {
+		if (mx < ww && mx > 0 && my < wh && my > 0) {
 
 			if (set_clone_source) {
-				g_context->clone_start_x = mx;
-				g_context->clone_start_y = my;
+				g_context->clone_start_x     = mx;
+				g_context->clone_start_y     = my;
+				util_brush_clone_source_down = true;
 			}
 			else {
-				if (g_context->brush_time == 0 && !base_is_dragging && !base_is_resizing && g_ui->combo_selected_handle == NULL) { // Paint started
+				if (g_context->brush_time == 0 && !base_is_dragging && !base_is_resizing && !ui_dock_is_dragging() &&
+				    g_ui->combo_selected_id == 0) { // Paint started
 
 					// Draw line
-					if (operator_shortcut(string("%s+%s", any_map_get(g_keymap, "brush_ruler"), any_map_get(g_keymap, "action_paint")), SHORTCUT_TYPE_DOWN)) {
+					if (keymap_shortcut(string_tmp("%s+%s", any_map_get(g_keymap, "brush_ruler"), any_map_get(g_keymap, "action_paint")), SHORTCUT_TYPE_DOWN)) {
 						g_context->last_paint_vec_x = g_context->last_paint_x;
 						g_context->last_paint_vec_y = g_context->last_paint_y;
 					}
 
-					history_push_undo = true;
+					history_push_undo = g_context->tool < TOOL_TYPE_PLUGIN; // Plugin tools do not paint layers
 
 					if (g_context->tool == TOOL_TYPE_CLONE && g_context->clone_start_x >= 0.0) { // Clone delta
 						g_context->clone_delta_x = (g_context->clone_start_x - mx) / (float)ww;
-						g_context->clone_delta_y = (g_context->clone_start_y - my) / (float)sys_h();
+						g_context->clone_delta_y = (g_context->clone_start_y - my) / (float)wh;
 						g_context->clone_start_x = -1;
 					}
 					else if (g_context->tool == TOOL_TYPE_FILL && g_context->fill_type == FILL_TYPE_UV_ISLAND) {
 						util_uv_uvislandmap_cached = false;
 					}
+					else if (g_context->tool == TOOL_TYPE_FILL && (g_context->fill_type == FILL_TYPE_MESH || g_context->fill_type == FILL_TYPE_SUBMESH)) {
+						render_path_paint_fill_pick = true;
+					}
 				}
 
 				g_context->brush_time += sys_delta();
-				brush_output_node_run();
+				if (g_context->tool >= TOOL_TYPE_PLUGIN) {
+					plugin_tool_t *t = plugin_tool_get(g_context->tool);
+					plugin_tool_call(t, t->on_stroke);
+				}
+				else {
+					brush_output_node_run();
+				}
 			}
 		}
 	}
@@ -78,9 +90,20 @@ void util_brush_update() {
 		g_context->brush_blend_dirty   = true; // Update brush mask
 		g_context->layer_preview_dirty = true; // Update layer preview
 
+		if (g_context->tool >= TOOL_TYPE_PLUGIN) {
+			plugin_tool_t *t = plugin_tool_get(g_context->tool);
+			plugin_tool_call(t, t->on_stroke_end);
+		}
+
 		// New color id picked, update fill layer
 		if (g_context->tool == TOOL_TYPE_COLORID && g_context->layer->fill_material != NULL) {
 			sys_notify_on_next_frame(&ui_base_update_ui_on_next_frame, NULL);
 		}
+	}
+
+	if (util_brush_clone_source_down && !paint_down && !pen_down("tip")) {
+		util_brush_clone_source_down = false;
+		g_context->clone_set_source  = false;
+		ui_header_handle->redraws    = 2;
 	}
 }

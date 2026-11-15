@@ -2,7 +2,7 @@
 #include "global.h"
 
 node_shader_t *node_shader_create(node_shader_context_t *ctx) {
-	node_shader_t *raw = GC_ALLOC_INIT(node_shader_t, {0});
+	node_shader_t *raw = ALLOC_INIT(node_shader_t, {0});
 	raw->context       = ctx;
 	raw->ins           = any_array_create_from_raw((void *[]){}, 0);
 	raw->outs          = any_array_create_from_raw((void *[]){}, 0);
@@ -42,7 +42,7 @@ void node_shader_context_add_constant(node_shader_context_t *raw, char *ctype, c
 		}
 	}
 
-	shader_const_t *c = GC_ALLOC_INIT(shader_const_t, {.name = name, .type = ctype});
+	shader_const_t *c = ALLOC_INIT(shader_const_t, {.name = name, .type = ctype});
 	if (link != NULL) {
 		c->link = string_copy(link);
 	}
@@ -51,13 +51,16 @@ void node_shader_context_add_constant(node_shader_context_t *raw, char *ctype, c
 }
 
 void node_shader_add_constant(node_shader_t *raw, char *s, char *link) {
-	// inp: float4
+	// float4 inp
 	if (string_array_index_of(raw->consts, s) == -1) {
-		string_array_t *ar    = string_split(s, ": ");
-		char           *uname = ar->buffer[0];
-		char           *utype = ar->buffer[1];
+		string_array_t *ar    = string_split(s, " ");
+		char           *utype = ar->buffer[0];
+		char           *uname = ar->buffer[1];
 		any_array_push(raw->consts, s);
 		node_shader_context_add_constant(raw->context, utype, uname, link);
+		// The context keeps uname / utype
+		array_free(ar);
+		free(ar);
 	}
 }
 
@@ -69,7 +72,7 @@ void node_shader_context_add_texture_unit(node_shader_context_t *raw, char *name
 		}
 	}
 
-	tex_unit_t *c = GC_ALLOC_INIT(tex_unit_t, {.name = name, .link = link});
+	tex_unit_t *c = ALLOC_INIT(tex_unit_t, {.name = string_copy(name), .link = string_copy(link)});
 	any_array_push(raw->data->texture_units, c);
 }
 
@@ -81,8 +84,15 @@ void node_shader_add_texture(node_shader_t *raw, char *name, char *link) {
 }
 
 void node_shader_add_function(node_shader_t *raw, char *s) {
-	char *fname = string_split(s, "(")->buffer[0];
+	string_array_t *ar    = string_split(s, "(");
+	char           *fname = ar->buffer[0];
+	for (i32 i = 1; i < ar->length; ++i) {
+		free(ar->buffer[i]);
+	}
+	array_free(ar);
+	free(ar);
 	if (any_map_get(raw->functions, fname) != NULL) {
+		free(fname);
 		return;
 	}
 	any_map_set(raw->functions, fname, s);
@@ -142,7 +152,7 @@ void node_shader_vstruct_to_vsin(node_shader_t *raw) {
 	vertex_element_t_array_t *vs = raw->context->data->vertex_elements;
 	for (i32 i = 0; i < vs->length; ++i) {
 		vertex_element_t *e = vs->buffer[i];
-		node_shader_add_in(raw, string("%s: float%s", e->name, node_shader_data_size(raw, e->data)));
+		node_shader_add_in(raw, string_tmp("float%s %s", node_shader_data_size(raw, e->data), e->name));
 	}
 }
 
@@ -164,42 +174,39 @@ char *node_shader_get(node_shader_t *raw) {
 		string_buffer_append(sb, (char *)raw->ins->buffer[i]);
 		string_buffer_append(sb, ";\n");
 	}
-	string_buffer_append(sb, "}\n\n");
+	string_buffer_append(sb, "};\n\n");
 
 	string_buffer_append(sb, "struct vert_out {\n");
-	string_buffer_append(sb, "\tpos: float4;\n");
+	string_buffer_append(sb, "\tfloat4 pos;\n");
 	for (i32 i = 0; i < raw->outs->length; ++i) {
 		string_buffer_append(sb, "\t");
 		string_buffer_append(sb, (char *)raw->outs->buffer[i]);
 		string_buffer_append(sb, ";\n");
 	}
 	if (raw->consts->length == 0) {
-		string_buffer_append(sb, "\tempty: float4;\n");
+		string_buffer_append(sb, "\tfloat4 empty;\n");
 	}
-	string_buffer_append(sb, "}\n\n");
+	string_buffer_append(sb, "};\n\n");
 
-	string_buffer_append(sb, "#[set(everything)]\n");
-	string_buffer_append(sb, "const constants: {\n");
+	string_buffer_append(sb, "cbuffer constants {\n");
 	for (i32 i = 0; i < raw->consts->length; ++i) {
 		string_buffer_append(sb, "\t");
 		string_buffer_append(sb, (char *)raw->consts->buffer[i]);
 		string_buffer_append(sb, ";\n");
 	}
 	if (raw->consts->length == 0) {
-		string_buffer_append(sb, "\tempty: float4;\n");
+		string_buffer_append(sb, "\tfloat4 empty;\n");
 	}
 	string_buffer_append(sb, "};\n\n");
 
 	if (raw->textures->length > 0) {
-		string_buffer_append(sb, "#[set(everything)]\n");
-		string_buffer_append(sb, "const sampler_linear: sampler;\n\n");
+		string_buffer_append(sb, "sampler sampler_linear;\n\n");
 	}
 
 	for (i32 i = 0; i < raw->textures->length; ++i) {
-		string_buffer_append(sb, "#[set(everything)]\n");
-		string_buffer_append(sb, "const ");
+		string_buffer_append(sb, "tex2d ");
 		string_buffer_append(sb, (char *)raw->textures->buffer[i]);
-		string_buffer_append(sb, ": tex2d;\n");
+		string_buffer_append(sb, ";\n");
 	}
 
 	string_array_t *keys = map_keys(raw->functions);
@@ -208,10 +215,12 @@ char *node_shader_get(node_shader_t *raw) {
 		string_buffer_append(sb, f);
 		string_buffer_append(sb, "\n");
 	}
+	array_free(keys);
+	free(keys);
 	string_buffer_append(sb, "\n");
 
-	string_buffer_append(sb, "fun kong_vert(input: vert_in): vert_out {\n");
-	string_buffer_append(sb, "\tvar output: vert_out;\n\n");
+	string_buffer_append(sb, "vert_out vert(vert_in input) {\n");
+	string_buffer_append(sb, "\tvert_out output;\n\n");
 	string_buffer_append(sb, string_buffer_get(&raw->vert_attribs));
 	string_buffer_append(sb, string_buffer_get(&raw->vert_normal));
 	string_buffer_append(sb, string_buffer_get(&raw->vert));
@@ -222,23 +231,20 @@ char *node_shader_get(node_shader_t *raw) {
 	string_buffer_append(sb, "\n\treturn output;\n");
 	string_buffer_append(sb, "}\n\n");
 
-	string_buffer_append(sb, "fun kong_frag(input: vert_out): ");
 	string_buffer_append(sb, raw->frag_out);
-	string_buffer_append(sb, " {\n");
-	string_buffer_append(sb, "\tvar output: ");
-	string_buffer_append(sb, raw->frag_out);
+	string_buffer_append(sb, " frag(vert_out input) {\n");
+	// float4[2] -> float4 output[2]
+	i32 frag_out_array = string_index_of(raw->frag_out, "[");
+	string_buffer_append(sb, "\t");
+	string_buffer_append(sb, frag_out_array > -1 ? substring(raw->frag_out, 0, frag_out_array) : raw->frag_out);
+	string_buffer_append(sb, " output");
+	string_buffer_append(sb, frag_out_array > -1 ? raw->frag_out + frag_out_array : "");
 	string_buffer_append(sb, ";\n\n");
 	string_buffer_append(sb, string_buffer_get(&raw->frag_attribs));
 	string_buffer_append(sb, string_buffer_get(&raw->frag_normal));
 	string_buffer_append(sb, string_buffer_get(&raw->frag));
 	string_buffer_append(sb, string_buffer_get(&raw->frag_end));
 	string_buffer_append(sb, "\n\treturn output;\n");
-	string_buffer_append(sb, "}\n\n");
-
-	string_buffer_append(sb, "#[pipe]\n");
-	string_buffer_append(sb, "struct pipe {\n");
-	string_buffer_append(sb, "\tvertex = kong_vert;\n");
-	string_buffer_append(sb, "\tfragment = kong_frag;\n");
 	string_buffer_append(sb, "}\n");
 
 	string_buffer_free(&raw->vert);
@@ -258,33 +264,61 @@ char *node_shader_get(node_shader_t *raw) {
 	return string_buffer_get(&out);
 }
 
+static void node_shader_array_delete(void *a) {
+	array_free(a);
+	free(a);
+}
+
+void node_shader_context_free(node_shader_context_t *raw) {
+	node_shader_t *kong = raw->kong;
+	if (kong != NULL) {
+		node_shader_array_delete(kong->ins);
+		node_shader_array_delete(kong->outs);
+		node_shader_array_delete(kong->consts);
+		node_shader_array_delete(kong->textures);
+		string_array_t *keys = kong->functions->keys;
+		for (i32 i = 0; i < keys->capacity; ++i) {
+			free(keys->buffer[i]);
+		}
+		node_shader_array_delete(kong->functions->keys);
+		node_shader_array_delete(kong->functions->values);
+		free(kong->functions);
+		free(kong);
+	}
+	free(raw);
+}
+
 node_shader_context_t *node_shader_context_create(material_t *material, shader_context_t *props) {
-	node_shader_context_t *raw = GC_ALLOC_INIT(node_shader_context_t, {0});
+	node_shader_context_t *raw = ALLOC_INIT(node_shader_context_t, {0});
 	raw->material              = material;
 
-	vertex_element_t_array_t *vertex_elements_default = any_array_create_from_raw(
-	    (void *[]){
-	        GC_ALLOC_INIT(vertex_element_t, {.name = "pos", .data = "short4norm"}),
-	        GC_ALLOC_INIT(vertex_element_t, {.name = "nor", .data = "short2norm"}),
-	    },
-	    2);
+	vertex_element_t_array_t *vertex_elements = props->vertex_elements;
+	if (vertex_elements == NULL) {
+		vertex_elements = any_array_create_from_raw(
+		    (void *[]){
+		        ALLOC_INIT(vertex_element_t, {.name = "pos", .data = "short4norm"}),
+		        ALLOC_INIT(vertex_element_t, {.name = "nor", .data = "short2norm"}),
+		    },
+		    2);
+	}
 
-	raw->data = GC_ALLOC_INIT(shader_context_t, {.name                    = props->name,
-	                                             .depth_write             = props->depth_write,
-	                                             .compare_mode            = props->compare_mode,
-	                                             .cull_mode               = props->cull_mode,
-	                                             .blend_source            = props->blend_source,
-	                                             .blend_destination       = props->blend_destination,
-	                                             .alpha_blend_source      = props->alpha_blend_source,
-	                                             .alpha_blend_destination = props->alpha_blend_destination,
-	                                             .fragment_shader         = "",
-	                                             .vertex_shader           = "",
-	                                             .vertex_elements         = props->vertex_elements != NULL ? props->vertex_elements : vertex_elements_default,
-	                                             .color_attachments       = props->color_attachments,
-	                                             .depth_attachment        = props->depth_attachment});
+	raw->data = ALLOC_INIT(shader_context_t, {.name                    = props->name,
+	                                          .depth_write             = props->depth_write,
+	                                          .compare_mode            = props->compare_mode,
+	                                          .cull_mode               = props->cull_mode,
+	                                          .blend_source            = props->blend_source,
+	                                          .blend_destination       = props->blend_destination,
+	                                          .alpha_blend_source      = props->alpha_blend_source,
+	                                          .alpha_blend_destination = props->alpha_blend_destination,
+	                                          .fragment_shader         = "",
+	                                          .vertex_shader           = "",
+	                                          .vertex_elements         = vertex_elements,
+	                                          .bind_textures           = any_array_create_from_raw((void *[]){}, 0),
+	                                          .color_attachments       = props->color_attachments,
+	                                          .depth_attachment        = props->depth_attachment});
 
 	shader_context_t *rw = raw->data;
-	rw->_                = GC_ALLOC_INIT(shader_context_runtime_t, {0});
+	rw->_                = ALLOC_INIT(shader_context_runtime_t, {0});
 
 	if (props->color_writes_red != NULL) {
 		raw->data->color_writes_red = props->color_writes_red;
@@ -301,6 +335,8 @@ node_shader_context_t *node_shader_context_create(material_t *material, shader_c
 
 	raw->data->texture_units = any_array_create_from_raw((void *[]){}, 0);
 	raw->data->constants     = i32_array_create_from_raw((i32[]){}, 0);
+
+	free(props);
 	return raw;
 }
 
@@ -311,7 +347,7 @@ void node_shader_context_add_elem(node_shader_context_t *raw, char *name, char *
 			return;
 		}
 	}
-	vertex_element_t *elem = GC_ALLOC_INIT(vertex_element_t, {.name = name, .data = data_type});
+	vertex_element_t *elem = ALLOC_INIT(vertex_element_t, {.name = name, .data = data_type});
 	any_array_push(raw->data->vertex_elements, elem);
 }
 
@@ -326,8 +362,8 @@ bool node_shader_context_is_elem(node_shader_context_t *raw, char *name) {
 }
 
 node_shader_t *node_shader_context_make_kong(node_shader_context_t *raw) {
-	raw->data->vertex_shader   = string("%s_%s.vert", raw->material->name, raw->data->name);
-	raw->data->fragment_shader = string("%s_%s.frag", raw->material->name, raw->data->name);
+	raw->data->vertex_shader   = string_tmp("%s_%s.vert", raw->material->name, raw->data->name);
+	raw->data->fragment_shader = string_tmp("%s_%s.frag", raw->material->name, raw->data->name);
 	raw->kong                  = node_shader_create(raw);
 	return raw->kong;
 }

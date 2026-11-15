@@ -1,11 +1,15 @@
 
 #include "../global.h"
 
-bool         ui_menu_hide_flag  = false;
-i32          ui_menu_sub_x      = 0;
-i32          ui_menu_sub_y      = 0;
-ui_handle_t *ui_menu_sub_handle = NULL;
-char        *_ui_menu_render_msg;
+bool  ui_menu_hide_flag     = false;
+i32   ui_menu_sub_x         = 0;
+i32   ui_menu_sub_y         = 0;
+char  ui_menu_sub_text[128] = ""; // Label of the open sub menu
+char *_ui_menu_render_msg;
+
+i32 ui_menu_padding() {
+	return math_floor(6 * UI_SCALE());
+}
 
 void ui_menu_hide() {
 	ui_menu_show = false;
@@ -15,6 +19,7 @@ void ui_menu_hide() {
 void ui_menu_fit_to_screen() {
 	// Prevent the menu going out of screen
 	f32 menu_w = base_default_element_w * UI_SCALE() * 2.3;
+	i32 menu_h = ui_menu_h + ui_menu_padding() * 2;
 	if (ui_menu_x + menu_w > iron_window_width()) {
 		if (ui_menu_x - menu_w > 0) {
 			ui_menu_x = math_floor(ui_menu_x - menu_w);
@@ -23,12 +28,12 @@ void ui_menu_fit_to_screen() {
 			ui_menu_x = math_floor(iron_window_width() - menu_w);
 		}
 	}
-	if (ui_menu_y + ui_menu_h > iron_window_height()) {
-		if (ui_menu_y - ui_menu_h > 0) {
-			ui_menu_y = math_floor(ui_menu_y - ui_menu_h);
+	if (ui_menu_y + menu_h > iron_window_height()) {
+		if (ui_menu_y - menu_h > 0) {
+			ui_menu_y = math_floor(ui_menu_y - menu_h);
 		}
 		else {
-			ui_menu_y = iron_window_height() - ui_menu_h;
+			ui_menu_y = iron_window_height() - menu_h;
 		}
 		ui_menu_x += 1; // Move out of mouse focus
 	}
@@ -58,14 +63,14 @@ void ui_menu_render() {
 
 	draw_begin(NULL, false, 0);
 	ui_begin_region(g_ui, ui_menu_x, ui_menu_y, menu_w);
-	g_ui->input_enabled = g_ui->combo_selected_handle == NULL;
+	g_ui->input_enabled = g_ui->combo_selected_id == 0;
 	ui_menu_begin();
 
 	if (ui_menu_commands != NULL) {
 		ui_menu_commands();
 	}
 
-	ui_menu_hide_flag = g_ui->combo_selected_handle == NULL && !ui_menu_keep_open && !ui_menu_show_first &&
+	ui_menu_hide_flag = g_ui->combo_selected_id == 0 && !ui_menu_keep_open && !ui_menu_show_first &&
 	                    (g_ui->changed || g_ui->input_released || g_ui->input_released_r || g_ui->is_escape_down);
 	ui_menu_keep_open = false;
 
@@ -80,7 +85,7 @@ void ui_menu_render() {
 	if (ui_menu_show_first) {
 		ui_menu_show_first = false;
 		ui_menu_keep_open  = true;
-		ui_menu_h          = g_ui->_y - ui_menu_y;
+		ui_menu_h          = g_ui->_y - ui_menu_y - ui_menu_padding();
 		if (out_of_screen) {
 			ui_menu_x += iron_window_width() * 2;
 			ui_menu_y += iron_window_height() * 2;
@@ -92,8 +97,7 @@ void ui_menu_render() {
 	if (ui_menu_hide_flag) {
 		ui_menu_hide();
 		ui_menu_show_first = true;
-		gc_unroot(ui_menu_commands);
-		ui_menu_commands = NULL;
+		ui_menu_commands   = NULL;
 	}
 }
 
@@ -103,13 +107,11 @@ void ui_menu_draw(void (*commands)(void), i32 x, i32 y) {
 		ui_menu_nested    = true;
 		ui_menu_keep_open = true;
 	}
-	ui_menu_show = true;
-	gc_unroot(ui_menu_commands);
+	ui_menu_show     = true;
 	ui_menu_commands = commands;
-	gc_root(ui_menu_commands);
-	ui_menu_x = x > -1 ? x : math_floor(mouse_x + 1);
-	ui_menu_y = y > -1 ? y : math_floor(mouse_y + 1);
-	ui_menu_h = 0;
+	ui_menu_x        = x > -1 ? x : math_floor(mouse_x + 1);
+	ui_menu_y        = y > -1 ? y : math_floor(mouse_y + 1);
+	ui_menu_h        = 0;
 }
 
 void ui_menu_separator() {
@@ -123,7 +125,7 @@ bool ui_menu_button(char *text, char *label, icon_t icon) {
 	}
 	i32  _x_left = g_ui->_x;
 	i32  _y_top  = g_ui->_y;
-	bool result  = ui_button(string("%s%s", config_button_spacing, text), config_button_align, label);
+	bool result  = ui_button(string_tmp("%s%s", config_button_spacing, text), config_button_align, label);
 	if (string_equals(label, ">") && result) {
 		ui_menu_keep_open = true;
 	}
@@ -156,14 +158,14 @@ bool ui_icon_button(char *text, icon_t icon, ui_align_t align) {
 	i32 _y_top  = g_ui->_y;
 	i32 _w      = g_ui->_w;
 	if (!string_equals(text, "")) {
-		text = align == UI_ALIGN_LEFT ? string("        %s", text) : string("      %s", text);
+		text = align == UI_ALIGN_LEFT ? string_tmp("       %s", text) : string_tmp("    %s", text);
 	}
 
 	char *tooltip = "";
 	i32   textw   = draw_string_width(g_font, g_ui->font_size, text);
 	f32   wmax    = g_config->touch_ui ? 0.9 : 0.8;
-	if (textw > _w * wmax) {
-		tooltip = string_copy(text);
+	if (textw > _w * wmax && align != UI_ALIGN_LEFT) { // Left aligned text is truncated with ".." by ui_button
+		tooltip = text;
 		text    = "";
 		textw   = 0;
 	}
@@ -185,9 +187,6 @@ bool ui_icon_button(char *text, icon_t icon, ui_align_t align) {
 
 		if (g_config->touch_ui) {
 			g_ui->_x += 1 * UI_SCALE();
-			if (!string_equals(text, "")) {
-				g_ui->_x += 5 * UI_SCALE();
-			}
 			g_ui->_y = _y_top + 2 * UI_SCALE();
 		}
 		if (g_ui->current_ratio > -1) {
@@ -205,19 +204,22 @@ bool ui_icon_button(char *text, icon_t icon, ui_align_t align) {
 	return result;
 }
 
-bool ui_menu_sub_button(ui_handle_t *handle, char *text) {
+bool ui_menu_sub_left() {
+	i32 offset = g_ui->_w + ui_menu_padding() * 2 + 2;
+	return g_ui->_x + g_ui->_w + offset > iron_window_width() && g_ui->_x - offset >= 0;
+}
+
+bool ui_menu_sub_button(char *text) {
 	g_ui->is_hovered = false;
 	ui_menu_button(text, ">", ICON_NONE);
+	f32 dx = ui_menu_sub_left() ? -g_ui->input_dx : g_ui->input_dx;
 	if (g_ui->is_hovered) {
-		gc_unroot(ui_menu_sub_handle);
-		ui_menu_sub_handle = handle;
-		gc_root(ui_menu_sub_handle);
+		snprintf(ui_menu_sub_text, sizeof(ui_menu_sub_text), "%s", text);
 	}
-	else if (math_abs(g_ui->input_dy) > g_ui->input_dx && g_ui->input_x < g_ui->_x + g_ui->_w) {
-		gc_unroot(ui_menu_sub_handle);
-		ui_menu_sub_handle = NULL;
+	else if (math_abs(g_ui->input_dy) > dx && g_ui->input_x >= g_ui->_x && g_ui->input_x < g_ui->_x + g_ui->_w) {
+		ui_menu_sub_text[0] = '\0';
 	}
-	return ui_menu_sub_handle == handle;
+	return string_equals(ui_menu_sub_text, text);
 }
 
 void ui_menu_label(char *text, char *shortcut) {
@@ -234,7 +236,7 @@ void ui_menu_label(char *text, char *shortcut) {
 
 void ui_menu_align() {
 	if (!g_config->touch_ui) {
-		f32_array_t *row = f32_array_create_from_raw(
+		f32_array_t *row = f32_array_create_from_raw_tmp(
 		    (f32[]){
 		        12 / 100.0,
 		        88 / 100.0,
@@ -246,10 +248,16 @@ void ui_menu_align() {
 }
 
 void ui_menu_begin() {
-	ui_draw_shadow(g_ui->_x, g_ui->_y, g_ui->_w, ui_menu_h);
+	// ui_menu_h is the height of the items, padding is added around them
+	i32 padding = ui_menu_padding();
+	i32 menu_h  = ui_menu_h + padding * 2;
+	ui_draw_shadow(g_ui->_x, g_ui->_y, g_ui->_w, menu_h);
 	draw_set_color(g_theme->SEPARATOR_COL);
-	ui_draw_rect(true, true, g_ui->_x, g_ui->_y, g_ui->_w, ui_menu_h);
+	ui_draw_rect(true, true, g_ui->_x, g_ui->_y, g_ui->_w, menu_h);
 	draw_set_color(0xffffffff);
+	g_ui->_x += padding;
+	g_ui->_y += padding;
+	g_ui->_w -= padding * 2;
 }
 
 void ui_menu_end() {}
@@ -257,11 +265,21 @@ void ui_menu_end() {}
 void ui_menu_sub_begin(i32 items) {
 	ui_menu_sub_x = g_ui->_x;
 	ui_menu_sub_y = g_ui->_y;
-	g_ui->_x += g_ui->_w + 2;
+	i32 padding   = ui_menu_padding();
+	i32 offset    = g_ui->_w + padding * 2 + 2;
+	g_ui->_x += ui_menu_sub_left() ? -offset : offset;
 	g_ui->_y -= UI_ELEMENT_H();
-	ui_draw_shadow(g_ui->_x, g_ui->_y, g_ui->_w, UI_ELEMENT_H() * items);
+	f32 h = UI_ELEMENT_H() * items + padding * 2;
+	// Keep long sub menus in the window
+	if (g_ui->_y - padding + h > iron_window_height()) {
+		g_ui->_y = math_max(padding, iron_window_height() - h + padding);
+	}
+	f32 x = g_ui->_x - padding;
+	f32 y = g_ui->_y - padding;
+	f32 w = g_ui->_w + padding * 2;
+	ui_draw_shadow(x, y, w, h);
 	draw_set_color(g_theme->SEPARATOR_COL);
-	ui_draw_rect(true, true, g_ui->_x, g_ui->_y, g_ui->_w, UI_ELEMENT_H() * items);
+	ui_draw_rect(true, true, x, y, w, h);
 	draw_set_color(0xffffffff);
 }
 

@@ -17,12 +17,15 @@ extern bool path_is_protected_linux;
 
 string_array_t *path_mesh_formats(void);
 string_array_t *path_texture_formats(void);
+string_array_t *path_text_formats(void);
 
 char *path_data(void);
 char *path_to_relative(char *from, char *to);
 char *path_normalize(char *path);
 char *path_base_dir(char *path);
 char *path_base_name(char *path);
+bool  path_has_ext(char *path, char *ext);
+char *path_ext(char *path);
 bool  path_is_mesh(char *path);
 bool  path_is_texture(char *path);
 bool  path_is_sound(char *path);

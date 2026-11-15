@@ -28,6 +28,17 @@ static bool                        resized = false;
 static void                       *readback_buffer;
 static int                         readback_buffer_size = 0;
 static bool                        linear_sampling      = true;
+static id<MTLCommandBuffer>        frames_pending[GPU_FRAMES_IN_FLIGHT];
+static bool                        discard_depth_store = false;
+
+static void wait_for_frames() {
+	for (int i = 0; i < GPU_FRAMES_IN_FLIGHT; ++i) {
+		if (frames_pending[i] != nil) {
+			[frames_pending[i] waitUntilCompleted];
+			frames_pending[i] = nil;
+		}
+	}
+}
 
 static MTLBlendFactor convert_blending_factor(gpu_blend_t factor) {
 	switch (factor) {
@@ -54,6 +65,8 @@ static MTLCompareFunction convert_compare_mode(gpu_compare_mode_t compare) {
 		return MTLCompareFunctionNever;
 	case GPU_COMPARE_MODE_EQUAL:
 		return MTLCompareFunctionEqual;
+	case GPU_COMPARE_MODE_GREATER:
+		return MTLCompareFunctionGreater;
 	case GPU_COMPARE_MODE_LESS:
 		return MTLCompareFunctionLess;
 	}
@@ -110,6 +123,7 @@ void gpu_render_target_init2(gpu_texture_t *target, uint32_t width, uint32_t hei
 		descriptor.resourceOptions       = MTLResourceStorageModePrivate;
 		target->impl._tex                = (__bridge_retained void *)[device newTextureWithDescriptor:descriptor];
 		if (target->impl._tex == nil) {
+			wait_for_frames();
 			gpu_cleanup();
 			target->impl._tex = (__bridge_retained void *)[device newTextureWithDescriptor:descriptor];
 		}
@@ -120,8 +134,18 @@ void gpu_resize_internal(int width, int height) {
 	resized = true;
 }
 
-static void next_drawable() {
-	CAMetalLayer *layer                       = get_metal_layer();
+void gpu_acquire_framebuffer() {
+	if (drawable != nil) {
+		return;
+	}
+	CAMetalLayer *layer = get_metal_layer();
+	if (resized) {
+		layer.drawableSize = CGSizeMake(iron_window_width(), iron_window_height());
+		for (int i = 0; i < GPU_FRAMEBUFFER_COUNT; ++i) {
+			gpu_render_target_init2(&framebuffers[i], iron_window_width(), iron_window_height(), GPU_TEXTURE_FORMAT_RGBA32, i);
+		}
+		resized = false;
+	}
 	drawable                                  = [layer nextDrawable];
 	framebuffers[framebuffer_index].impl._tex = (__bridge void *)drawable.texture;
 }
@@ -172,7 +196,6 @@ void gpu_init_internal(int depth_buffer_bits, bool vsync) {
 	argument_buffer      = [device newBufferWithLength:(argument_buffer_step * GPU_CONSTANT_BUFFER_MULTIPLE) options:MTLResourceStorageModeShared];
 
 	gpu_create_framebuffers(depth_buffer_bits);
-	next_drawable();
 }
 
 void gpu_begin_internal(gpu_clear_t flags, unsigned color, float depth) {
@@ -187,7 +210,7 @@ void gpu_begin_internal(gpu_clear_t flags, unsigned color, float depth) {
 			render_pass_desc.colorAttachments[i].clearColor  = MTLClearColorMake(red, green, blue, alpha);
 		}
 		else {
-			render_pass_desc.colorAttachments[i].loadAction  = MTLLoadActionLoad;
+			render_pass_desc.colorAttachments[i].loadAction  = (flags & GPU_CLEAR_DONT_LOAD_COLOR) ? MTLLoadActionDontCare : MTLLoadActionLoad;
 			render_pass_desc.colorAttachments[i].storeAction = MTLStoreActionStore;
 			render_pass_desc.colorAttachments[i].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 		}
@@ -208,6 +231,11 @@ void gpu_begin_internal(gpu_clear_t flags, unsigned color, float depth) {
 		render_pass_desc.depthAttachment.storeAction = MTLStoreActionStore;
 	}
 
+	discard_depth_store = current_depth_buffer != NULL && (flags & GPU_CLEAR_DONT_STORE_DEPTH);
+	if (discard_depth_store) {
+		render_pass_desc.depthAttachment.storeAction = MTLStoreActionUnknown;
+	}
+
 	id<MTLCommandQueue> queue = get_metal_queue();
 
 	if (command_buffer == nil) {
@@ -219,6 +247,8 @@ void gpu_begin_internal(gpu_clear_t flags, unsigned color, float depth) {
 	current_viewport.originY = 0;
 	current_viewport.width   = current_render_targets[0]->width;
 	current_viewport.height  = current_render_targets[0]->height;
+	current_viewport.znear   = 0.0;
+	current_viewport.zfar    = 1.0;
 	current_scissor.x        = 0;
 	current_scissor.y        = 0;
 	current_scissor.width    = current_render_targets[0]->width;
@@ -226,17 +256,24 @@ void gpu_begin_internal(gpu_clear_t flags, unsigned color, float depth) {
 }
 
 void gpu_end_internal() {
+	if (discard_depth_store) {
+		[command_encoder setDepthStoreAction:MTLStoreActionDontCare];
+	}
 	[command_encoder endEncoding];
 	current_render_targets_count = 0;
 }
 
 void gpu_execute_and_wait() {
 	if (gpu_in_use) {
+		if (discard_depth_store) {
+			[command_encoder setDepthStoreAction:MTLStoreActionStore];
+		}
 		[command_encoder endEncoding];
 	}
 
 	[command_buffer commit];
 	[command_buffer waitUntilCompleted];
+	wait_for_frames();
 	id<MTLCommandQueue> queue = get_metal_queue();
 	command_buffer            = [queue commandBuffer];
 
@@ -260,36 +297,45 @@ void gpu_execute_and_wait() {
 }
 
 void gpu_present_internal() {
-	[command_buffer presentDrawable:drawable];
+	if (drawable != nil) {
+		[command_buffer presentDrawable:drawable];
+	}
 	[command_buffer commit];
-	[command_buffer waitUntilCompleted];
+	frames_pending[gpu_frame_index] = command_buffer;
 
-	drawable        = nil;
-	command_buffer  = nil;
-	command_encoder = nil;
-
-	if (resized) {
-		CAMetalLayer *layer = get_metal_layer();
-		layer.drawableSize  = CGSizeMake(iron_window_width(), iron_window_height());
-		for (int i = 0; i < GPU_FRAMEBUFFER_COUNT; ++i) {
-			// gpu_texture_destroy_internal(&framebuffers[i]);
-			gpu_render_target_init2(&framebuffers[i], iron_window_width(), iron_window_height(), GPU_TEXTURE_FORMAT_RGBA32, i);
-		}
-		resized = false;
+	if (gpu_cleanup_pending()) {
+		wait_for_frames();
 	}
 
-	next_drawable();
+	drawable                                  = nil;
+	framebuffers[framebuffer_index].impl._tex = NULL;
+	command_buffer                            = nil;
+	command_encoder                           = nil;
+
+	gpu_frame_index = (gpu_frame_index + 1) % GPU_FRAMES_IN_FLIGHT;
+	if (frames_pending[gpu_frame_index] != nil) {
+		[frames_pending[gpu_frame_index] waitUntilCompleted];
+		frames_pending[gpu_frame_index] = nil;
+	}
+
+	gpu_acquire_framebuffer();
 }
 
 void gpu_barrier(gpu_texture_t *render_target, gpu_texture_state_t state_after) {}
 
 void gpu_draw_internal() {
+	if (current_ib->count == 0) {
+		return;
+	}
 	id<MTLBuffer> index_buffer = (__bridge id<MTLBuffer>)current_ib->impl.metal_buffer;
 	[command_encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
 	                            indexCount:current_ib->count
 	                             indexType:MTLIndexTypeUInt32
 	                           indexBuffer:index_buffer
-	                     indexBufferOffset:0];
+	                     indexBufferOffset:0
+	                         instanceCount:1
+	                            baseVertex:current_vb->start
+	                          baseInstance:0];
 }
 
 void gpu_viewport(int x, int y, int width, int height) {
@@ -297,8 +343,8 @@ void gpu_viewport(int x, int y, int width, int height) {
 	current_viewport.originY = y;
 	current_viewport.width   = width;
 	current_viewport.height  = height;
-	current_viewport.znear   = 0.1;
-	current_viewport.zfar    = 100.0;
+	current_viewport.znear   = 0.0;
+	current_viewport.zfar    = 1.0;
 	[command_encoder setViewport:current_viewport];
 }
 
@@ -513,6 +559,8 @@ void gpu_shader_destroy(gpu_shader_t *shader) {
 	id<MTLFunction> function  = (__bridge_transfer id<MTLFunction>)shader->impl.mtl_function;
 	function                  = nil;
 	shader->impl.mtl_function = NULL;
+	free(shader->impl.source);
+	shader->impl.source = NULL;
 }
 
 void gpu_shader_init(gpu_shader_t *shader, const void *data, size_t length, gpu_shader_type_t type) {
@@ -527,11 +575,82 @@ void gpu_shader_init(gpu_shader_t *shader, const void *data, size_t length, gpu_
 		shader->impl.name[i - 3] = source[i];
 	}
 
-	shader->impl.source = data;
+	shader->impl.source = malloc(length);
+	memcpy(shader->impl.source, data, length);
 	shader->impl.length = length;
 }
 
-void gpu_texture_init_from_bytes(gpu_texture_t *texture, void *data, uint32_t width, uint32_t height, gpu_texture_format_t format) {
+#ifdef WITH_BC7
+
+// Gpu bc7 encoder: rgba8 pixels -> compute shader -> bc7 blocks buffer -> blit into the texture
+// Buffer indices follow kong's declaration order in gpu_bc7.shader: constants 0, src 1, dst 2
+#include "metal_bc7.h"
+
+static bool                        bc7_compute_checked = false;
+static id<MTLComputePipelineState> bc7_pipeline        = nil;
+static id<MTLBuffer>               bc7_src             = nil;
+static id<MTLBuffer>               bc7_dst             = nil;
+
+static bool bc7_compute_available() {
+	if (!bc7_compute_checked) {
+		bc7_compute_checked    = true;
+		id<MTLDevice>  device  = get_metal_device();
+		NSError       *error   = nil;
+		id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:metal_bc7_source] options:nil error:&error];
+		if (library != nil) {
+			bc7_pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"bc7_encode"] error:&error];
+		}
+		if (bc7_pipeline == nil || bc7_pipeline.maxTotalThreadsPerThreadgroup < 64) {
+			iron_log("Gpu bc7 encoder unavailable, using cpu%s%s", error != nil ? ": " : "", error != nil ? error.localizedDescription.UTF8String : "");
+			bc7_pipeline = nil;
+		}
+	}
+	return bc7_pipeline != nil;
+}
+
+static void bc7_compute_encode(id<MTLTexture> tex, void *pixels, uint32_t width, uint32_t height) {
+	id<MTLDevice> device      = get_metal_device();
+	uint32_t      blocks_x    = (width + 3) / 4;
+	uint32_t      blocks_y    = (height + 3) / 4;
+	NSUInteger    pixels_size = (NSUInteger)width * height * 4;
+	NSUInteger    blocks_size = (NSUInteger)blocks_x * blocks_y * 16;
+	if (bc7_src == nil || bc7_src.length < pixels_size) {
+		bc7_src = [device newBufferWithLength:pixels_size options:MTLResourceStorageModeShared];
+	}
+	if (bc7_dst == nil || bc7_dst.length < blocks_size) {
+		bc7_dst = [device newBufferWithLength:blocks_size options:MTLResourceStorageModePrivate];
+	}
+	memcpy(bc7_src.contents, pixels, pixels_size);
+	float size[4] = {(float)width, (float)height, (float)blocks_x, (float)blocks_y};
+
+	id<MTLCommandQueue>          queue   = get_metal_queue();
+	id<MTLCommandBuffer>         buffer  = [queue commandBuffer];
+	id<MTLComputeCommandEncoder> compute = [buffer computeCommandEncoder];
+	[compute setComputePipelineState:bc7_pipeline];
+	[compute setBytes:size length:sizeof(size) atIndex:0];
+	[compute setBuffer:bc7_src offset:0 atIndex:1];
+	[compute setBuffer:bc7_dst offset:0 atIndex:2];
+	[compute dispatchThreadgroups:MTLSizeMake((blocks_x + 63) / 64, blocks_y, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[compute endEncoding];
+
+	id<MTLBlitCommandEncoder> blit = [buffer blitCommandEncoder];
+	[blit copyFromBuffer:bc7_dst
+	           sourceOffset:0
+	      sourceBytesPerRow:blocks_x * 16
+	    sourceBytesPerImage:blocks_size
+	             sourceSize:MTLSizeMake(width, height, 1)
+	              toTexture:tex
+	       destinationSlice:0
+	       destinationLevel:0
+	      destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit endEncoding];
+	[buffer commit];
+	[buffer waitUntilCompleted];
+}
+
+#endif
+
+void gpu_texture_init_from_bytes(gpu_texture_t *texture, void *data, uint32_t width, uint32_t height, gpu_texture_format_t format, bool compress) {
 	texture->width  = width;
 	texture->height = height;
 	texture->format = format;
@@ -548,12 +667,16 @@ void gpu_texture_init_from_bytes(gpu_texture_t *texture, void *data, uint32_t wi
 	int   bytes_per_image = bytes_per_row * height;
 
 #ifdef WITH_BC7
-	if (gpu_bc7_supported(width, height, format)) {
+	bool bc7_gpu = false;
+	if (compress && gpu_bc7_supported(width, height, format)) {
 		texture->format = GPU_TEXTURE_FORMAT_RGBA32_BC7;
 		mtlformat       = MTLPixelFormatBC7_RGBAUnorm;
-		data            = gpu_bc7_compress(data, width, height);
-		bytes_per_row   = ((width + 3) / 4) * 16; // BC7ENC_BLOCK_SIZE
-		bytes_per_image = bytes_per_row * ((height + 3) / 4);
+		bc7_gpu         = bc7_compute_available();
+		if (!bc7_gpu) {
+			data            = gpu_bc7_compress(data, width, height);
+			bytes_per_row   = ((width + 3) / 4) * 16; // BC7ENC_BLOCK_SIZE
+			bytes_per_image = bytes_per_row * ((height + 3) / 4);
+		}
 	}
 #endif
 
@@ -570,17 +693,26 @@ void gpu_texture_init_from_bytes(gpu_texture_t *texture, void *data, uint32_t wi
 	id<MTLDevice>  device = get_metal_device();
 	id<MTLTexture> tex    = [device newTextureWithDescriptor:descriptor];
 	if (tex == nil) {
+		wait_for_frames();
 		gpu_cleanup();
 #ifdef WITH_BC7
 		if (data != original_data) {
 			free(data);
 		}
 #endif
-		gpu_texture_init_from_bytes(texture, original_data, width, height, format);
+		gpu_texture_init_from_bytes(texture, original_data, width, height, format, compress);
 		return;
 	}
 	texture->impl._tex = (__bridge_retained void *)tex;
-	[tex replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 slice:0 withBytes:data bytesPerRow:bytes_per_row bytesPerImage:bytes_per_image];
+#ifdef WITH_BC7
+	if (bc7_gpu) {
+		bc7_compute_encode(tex, data, width, height);
+	}
+	else
+#endif
+	{
+		[tex replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 slice:0 withBytes:data bytesPerRow:bytes_per_row bytesPerImage:bytes_per_image];
+	}
 
 #ifdef WITH_BC7
 	if (data != original_data) {
@@ -600,7 +732,9 @@ void gpu_render_target_init(gpu_texture_t *target, uint32_t width, uint32_t heig
 }
 
 void gpu_vertex_buffer_init(gpu_buffer_t *buffer, uint32_t count, gpu_vertex_structure_t *structure) {
-	buffer->count = count;
+	buffer->count     = count;
+	buffer->start     = 0;
+	buffer->cpu_write = false;
 	for (int i = 0; i < structure->size; ++i) {
 		gpu_vertex_element_t element = structure->elements[i];
 		buffer->stride += gpu_vertex_data_size(element.data);
@@ -610,20 +744,26 @@ void gpu_vertex_buffer_init(gpu_buffer_t *buffer, uint32_t count, gpu_vertex_str
 	MTLResourceOptions options = MTLResourceCPUCacheModeWriteCombined;
 	options |= MTLResourceStorageModeShared;
 
-	id<MTLBuffer> buf = [device newBufferWithLength:count * buffer->stride options:options];
+	id<MTLBuffer> buf = [device newBufferWithLength:gpu_buffer_alloc_size(count, buffer->stride) options:options];
 	if (buf == nil) {
+		wait_for_frames();
 		gpu_cleanup();
-		buf = [device newBufferWithLength:count * buffer->stride options:options];
+		buf = [device newBufferWithLength:gpu_buffer_alloc_size(count, buffer->stride) options:options];
 	}
 	buffer->impl.metal_buffer = (__bridge_retained void *)buf;
 }
 
 void *gpu_vertex_buffer_lock(gpu_buffer_t *buffer) {
+	if (!buffer->cpu_write) {
+		wait_for_frames();
+	}
 	id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer->impl.metal_buffer;
 	return [buf contents];
 }
 
-void gpu_vertex_buffer_unlock(gpu_buffer_t *buffer) {}
+void gpu_vertex_buffer_unlock(gpu_buffer_t *buffer) {
+	buffer->version = ++gpu_buffer_versions;
+}
 
 void gpu_index_buffer_init(gpu_buffer_t *buffer, uint32_t count) {
 	buffer->count = count;
@@ -632,19 +772,23 @@ void gpu_index_buffer_init(gpu_buffer_t *buffer, uint32_t count) {
 	MTLResourceOptions options = MTLResourceCPUCacheModeWriteCombined;
 	options |= MTLResourceStorageModeShared;
 
-	buffer->impl.metal_buffer = (__bridge_retained void *)[device newBufferWithLength:sizeof(uint32_t) * count options:options];
+	buffer->impl.metal_buffer = (__bridge_retained void *)[device newBufferWithLength:gpu_buffer_alloc_size(count, sizeof(uint32_t)) options:options];
 	if (buffer->impl.metal_buffer == nil) {
+		wait_for_frames();
 		gpu_cleanup();
-		buffer->impl.metal_buffer = (__bridge_retained void *)[device newBufferWithLength:sizeof(uint32_t) * count options:options];
+		buffer->impl.metal_buffer = (__bridge_retained void *)[device newBufferWithLength:gpu_buffer_alloc_size(count, sizeof(uint32_t)) options:options];
 	}
 }
 
 void *gpu_index_buffer_lock(gpu_buffer_t *buffer) {
+	wait_for_frames();
 	id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer->impl.metal_buffer;
 	return [buf contents];
 }
 
-void gpu_index_buffer_unlock(gpu_buffer_t *buffer) {}
+void gpu_index_buffer_unlock(gpu_buffer_t *buffer) {
+	buffer->version = ++gpu_buffer_versions;
+}
 
 void gpu_constant_buffer_init(gpu_buffer_t *buffer, uint32_t size) {
 	buffer->count             = size;
@@ -686,6 +830,13 @@ typedef struct inst {
 	int    i;
 } inst_t;
 
+typedef struct rt_instance_data {
+	uint64_t vertex_buffer; // GPU addresses
+	uint64_t index_buffer;
+	uint32_t stride;
+	uint32_t geometry;
+} rt_instance_data_t;
+
 static gpu_acceleration_structure_t *accel;
 static gpu_raytrace_pipeline_t      *pipeline;
 static gpu_texture_t                *output = NULL;
@@ -701,13 +852,19 @@ static gpu_texture_t                *_texenv;
 static gpu_texture_t                *_texsobol;
 static gpu_texture_t                *_texscramble;
 static gpu_texture_t                *_texrank;
-static gpu_buffer_t                 *vb[16];
-static gpu_buffer_t                 *vb_last[16];
-static gpu_buffer_t                 *ib[16];
+static gpu_texture_t                *_texenv_cdf;
+static gpu_texture_t                *geometry_tex[GPU_RAYTRACE_MAX_OBJECTS][3]; // NULL uses the shared textures
+static id<MTLBuffer>                 _geometry_textures = nil;
+static gpu_buffer_t                 *vb[GPU_RAYTRACE_MAX_OBJECTS];
+static gpu_buffer_t                 *vb_last[GPU_RAYTRACE_MAX_OBJECTS];
+static uint32_t                      vb_version_last[GPU_RAYTRACE_MAX_OBJECTS];
+static uint32_t                      ib_version_last[GPU_RAYTRACE_MAX_OBJECTS];
+static gpu_buffer_t                 *ib[GPU_RAYTRACE_MAX_OBJECTS];
 static int                           vb_count      = 0;
 static int                           vb_count_last = 0;
 static inst_t                        instances[1024];
 static int                           instances_count = 0;
+static id<MTLBuffer>                 _instance_data  = nil;
 
 void gpu_raytrace_pipeline_init(gpu_raytrace_pipeline_t *pipeline, void *shader, int ray_shader_size, gpu_buffer_t *constant_buffer) {
 	id<MTLDevice> device = get_metal_device();
@@ -724,7 +881,7 @@ void gpu_raytrace_pipeline_init(gpu_raytrace_pipeline_t *pipeline, void *shader,
 	}
 
 	MTLComputePipelineDescriptor *descriptor                   = [[MTLComputePipelineDescriptor alloc] init];
-	descriptor.computeFunction                                 = [library newFunctionWithName:@"raytracingKernel"];
+	descriptor.computeFunction                                 = [library newFunctionWithName:@"raytrace"];
 	descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
 	_raytracing_pipeline = [device newComputePipelineStateWithDescriptor:descriptor options:0 reflection:nil error:&error];
 	_semaphore           = dispatch_semaphore_create(2);
@@ -771,10 +928,12 @@ id<MTLAccelerationStructure> create_acceleration_sctructure(MTLAccelerationStruc
 void gpu_raytrace_acceleration_structure_init(gpu_acceleration_structure_t *accel) {
 	vb_count        = 0;
 	instances_count = 0;
-	memset(vb_last, 0, sizeof(vb_last));
+	memset(vb, 0, sizeof(vb));
+	memset(geometry_tex, 0, sizeof(geometry_tex));
 }
 
-void gpu_raytrace_acceleration_structure_add(gpu_acceleration_structure_t *accel, gpu_buffer_t *_vb, gpu_buffer_t *_ib, mat4_t _transform) {
+void gpu_raytrace_acceleration_structure_add(gpu_acceleration_structure_t *accel, gpu_buffer_t *_vb, gpu_buffer_t *_ib, mat4_t _transform,
+                                             gpu_texture_t **textures) {
 
 	int vb_i = -1;
 	for (int i = 0; i < vb_count; ++i) {
@@ -784,10 +943,20 @@ void gpu_raytrace_acceleration_structure_add(gpu_acceleration_structure_t *accel
 		}
 	}
 	if (vb_i == -1) {
+		if (vb_count >= GPU_RAYTRACE_MAX_OBJECTS) {
+			return;
+		}
 		vb_i         = vb_count;
 		vb[vb_count] = _vb;
 		ib[vb_count] = _ib;
+		for (int k = 0; k < 3; ++k) {
+			geometry_tex[vb_count][k] = textures != NULL ? textures[k] : NULL;
+		}
 		vb_count++;
+	}
+
+	if (instances_count >= (int)(sizeof(instances) / sizeof(instances[0]))) {
+		return;
 	}
 
 	inst_t inst                = {.i = vb_i, .m = _transform};
@@ -803,16 +972,22 @@ void _gpu_raytrace_acceleration_structure_destroy_bottom(gpu_acceleration_struct
 
 void _gpu_raytrace_acceleration_structure_destroy_top(gpu_acceleration_structure_t *accel) {
 	_instance_accel = nil;
+	_instance_data  = nil;
 }
 
-void gpu_raytrace_acceleration_structure_build(gpu_acceleration_structure_t *accel, gpu_buffer_t *_vb_full, gpu_buffer_t *_ib_full) {
+void gpu_raytrace_acceleration_structure_build(gpu_acceleration_structure_t *accel) {
+	gpu_execute_and_wait();
 
 	bool build_bottom = false;
-	for (int i = 0; i < 16; ++i) {
-		if (vb_last[i] != vb[i]) {
+	for (int i = 0; i < GPU_RAYTRACE_MAX_OBJECTS; ++i) {
+		uint32_t vb_version = vb[i] != NULL ? vb[i]->version : 0;
+		uint32_t ib_version = vb[i] != NULL ? ib[i]->version : 0;
+		if (vb_last[i] != vb[i] || vb_version_last[i] != vb_version || ib_version_last[i] != ib_version) {
 			build_bottom = true;
 		}
-		vb_last[i] = vb[i];
+		vb_last[i]         = vb[i];
+		vb_version_last[i] = vb_version;
+		ib_version_last[i] = ib_version;
 	}
 
 	if (vb_count_last > 0) {
@@ -835,42 +1010,67 @@ void gpu_raytrace_acceleration_structure_build(gpu_acceleration_structure_t *acc
 
 	MTLResourceOptions options = MTLResourceStorageModeShared;
 
-	MTLAccelerationStructureTriangleGeometryDescriptor *descriptor = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-	descriptor.indexType                                           = MTLIndexTypeUInt32;
-	descriptor.indexBuffer                                         = (__bridge id<MTLBuffer>)ib[0]->impl.metal_buffer;
-	descriptor.vertexBuffer                                        = (__bridge id<MTLBuffer>)vb[0]->impl.metal_buffer;
-	descriptor.vertexStride                                        = vb[0]->stride;
-	descriptor.triangleCount                                       = ib[0]->count / 3;
-	descriptor.vertexFormat                                        = MTLAttributeFormatShort4Normalized;
+	// Bottom level
+	if (build_bottom || _primitive_accels == nil) {
+		_primitive_accels = [[NSMutableArray alloc] init];
+		for (int i = 0; i < vb_count; ++i) {
+			MTLAccelerationStructureTriangleGeometryDescriptor *descriptor = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+			descriptor.indexType                                           = MTLIndexTypeUInt32;
+			descriptor.indexBuffer                                         = (__bridge id<MTLBuffer>)ib[i]->impl.metal_buffer;
+			descriptor.vertexBuffer                                        = (__bridge id<MTLBuffer>)vb[i]->impl.metal_buffer;
+			descriptor.vertexStride                                        = vb[i]->stride;
+			descriptor.triangleCount                                       = ib[i]->count / 3;
+			descriptor.vertexFormat                                        = MTLAttributeFormatShort4Normalized;
 
-	MTLPrimitiveAccelerationStructureDescriptor *accel_descriptor = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
-	accel_descriptor.geometryDescriptors                          = @[ descriptor ];
-	id<MTLAccelerationStructure> acceleration_structure           = create_acceleration_sctructure(accel_descriptor);
-	_primitive_accels                                             = [[NSMutableArray alloc] init];
-	[_primitive_accels addObject:acceleration_structure];
+			MTLPrimitiveAccelerationStructureDescriptor *accel_descriptor = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+			accel_descriptor.geometryDescriptors                          = @[ descriptor ];
+			[_primitive_accels addObject:create_acceleration_sctructure(accel_descriptor)];
+		}
+	}
 
-	id<MTLBuffer> instance_buffer = [device newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) * 1 options:options];
+	// Top level
+	int instance_count = instances_count;
 
-	MTLAccelerationStructureInstanceDescriptor *instance_descriptors = (MTLAccelerationStructureInstanceDescriptor *)instance_buffer.contents;
-	instance_descriptors[0].accelerationStructureIndex               = 0;
-	instance_descriptors[0].options                                  = MTLAccelerationStructureInstanceOptionOpaque;
-	instance_descriptors[0].mask                                     = 1;
-	instance_descriptors[0].transformationMatrix.columns[0]          = MTLPackedFloat3Make(instances[0].m.m[0], instances[0].m.m[1], instances[0].m.m[2]);
-	instance_descriptors[0].transformationMatrix.columns[1]          = MTLPackedFloat3Make(instances[0].m.m[4], instances[0].m.m[5], instances[0].m.m[6]);
-	instance_descriptors[0].transformationMatrix.columns[2]          = MTLPackedFloat3Make(instances[0].m.m[8], instances[0].m.m[9], instances[0].m.m[10]);
-	instance_descriptors[0].transformationMatrix.columns[3]          = MTLPackedFloat3Make(instances[0].m.m[12], instances[0].m.m[13], instances[0].m.m[14]);
+	id<MTLBuffer> instance_buffer = [device newBufferWithLength:sizeof(MTLAccelerationStructureUserIDInstanceDescriptor) * instance_count options:options];
+	MTLAccelerationStructureUserIDInstanceDescriptor *instance_descriptors = (MTLAccelerationStructureUserIDInstanceDescriptor *)instance_buffer.contents;
+
+	for (int i = 0; i < instance_count; ++i) {
+		float *m = instances[i].m.m;
+
+		instance_descriptors[i].accelerationStructureIndex      = instances[i].i;
+		instance_descriptors[i].options                         = MTLAccelerationStructureInstanceOptionOpaque;
+		instance_descriptors[i].mask                            = 1;
+		instance_descriptors[i].intersectionFunctionTableOffset = 0;
+		instance_descriptors[i].transformationMatrix.columns[0] = MTLPackedFloat3Make(m[0], m[1], m[2]);
+		instance_descriptors[i].transformationMatrix.columns[1] = MTLPackedFloat3Make(m[4], m[5], m[6]);
+		instance_descriptors[i].transformationMatrix.columns[2] = MTLPackedFloat3Make(m[8], m[9], m[10]);
+		instance_descriptors[i].transformationMatrix.columns[3] = MTLPackedFloat3Make(m[12], m[13], m[14]);
+
+		instance_descriptors[i].userID = i;
+	}
 
 	MTLInstanceAccelerationStructureDescriptor *inst_accel_descriptor = [MTLInstanceAccelerationStructureDescriptor descriptor];
 	inst_accel_descriptor.instancedAccelerationStructures             = _primitive_accels;
-	inst_accel_descriptor.instanceCount                               = 1;
+	inst_accel_descriptor.instanceCount                               = instance_count;
 	inst_accel_descriptor.instanceDescriptorBuffer                    = instance_buffer;
+	inst_accel_descriptor.instanceDescriptorType                      = MTLAccelerationStructureInstanceDescriptorTypeUserID;
 	_instance_accel                                                   = create_acceleration_sctructure(inst_accel_descriptor);
+
+	_instance_data           = [device newBufferWithLength:sizeof(rt_instance_data_t) * instances_count options:options];
+	rt_instance_data_t *data = (rt_instance_data_t *)_instance_data.contents;
+	for (int i = 0; i < instances_count; ++i) {
+		inst_t *inst          = &instances[i];
+		data[i].vertex_buffer = ((__bridge id<MTLBuffer>)vb[inst->i]->impl.metal_buffer).gpuAddress;
+		data[i].index_buffer  = ((__bridge id<MTLBuffer>)ib[inst->i]->impl.metal_buffer).gpuAddress;
+		data[i].stride        = vb[inst->i]->stride;
+		data[i].geometry      = inst->i;
+	}
 }
 
 void gpu_raytrace_acceleration_structure_destroy(gpu_acceleration_structure_t *accel) {}
 
 void gpu_raytrace_set_textures(gpu_texture_t *texpaint0, gpu_texture_t *texpaint1, gpu_texture_t *texpaint2, gpu_texture_t *texenv, gpu_texture_t *texsobol,
-                               gpu_texture_t *texscramble, gpu_texture_t *texrank) {
+                               gpu_texture_t *texscramble, gpu_texture_t *texrank, gpu_texture_t *texenv_cdf) {
 	_texpaint0   = texpaint0;
 	_texpaint1   = texpaint1;
 	_texpaint2   = texpaint2;
@@ -878,6 +1078,7 @@ void gpu_raytrace_set_textures(gpu_texture_t *texpaint0, gpu_texture_t *texpaint
 	_texsobol    = texsobol;
 	_texscramble = texscramble;
 	_texrank     = texrank;
+	_texenv_cdf  = texenv_cdf != NULL ? texenv_cdf : texenv;
 }
 
 void gpu_raytrace_set_acceleration_structure(gpu_acceleration_structure_t *_accel) {
@@ -895,6 +1096,8 @@ void gpu_raytrace_set_target(gpu_texture_t *_output) {
 void gpu_raytrace_dispatch_rays() {
 	id<MTLDevice> device = get_metal_device();
 	if (!device.supportsRaytracing)
+		return;
+	if (_instance_accel == nil || _instance_data == nil)
 		return;
 	dispatch_semaphore_wait(_semaphore, DISPATCH_TIME_FOREVER);
 
@@ -914,8 +1117,25 @@ void gpu_raytrace_dispatch_rays() {
 	id<MTLComputeCommandEncoder> compute_encoder = [command_buffer computeCommandEncoder];
 	[compute_encoder setBuffer:(__bridge id<MTLBuffer>)constant_buf->impl.metal_buffer offset:0 atIndex:0];
 	[compute_encoder setAccelerationStructure:_instance_accel atBufferIndex:1];
-	[compute_encoder setBuffer:(__bridge id<MTLBuffer>)ib[0]->impl.metal_buffer offset:0 atIndex:2];
-	[compute_encoder setBuffer:(__bridge id<MTLBuffer>)vb[0]->impl.metal_buffer offset:0 atIndex:3];
+	[compute_encoder setBuffer:_instance_data offset:0 atIndex:2];
+
+	if (_geometry_textures == nil) {
+		_geometry_textures = [device newBufferWithLength:sizeof(MTLResourceID) * GPU_RAYTRACE_MAX_OBJECTS * 3 options:MTLResourceStorageModeShared];
+	}
+	gpu_texture_t *shared_tex[3] = {_texpaint0, _texpaint1, _texpaint2};
+	MTLResourceID *texture_ids   = (MTLResourceID *)_geometry_textures.contents;
+	for (int i = 0; i < GPU_RAYTRACE_MAX_OBJECTS; ++i) {
+		int g = i < vb_count ? i : 0;
+		for (int k = 0; k < 3; ++k) {
+			gpu_texture_t *tex     = geometry_tex[g][k] != NULL ? geometry_tex[g][k] : shared_tex[k];
+			id<MTLTexture> mtl_tex = (__bridge id<MTLTexture>)tex->impl._tex;
+			texture_ids[i * 3 + k] = mtl_tex.gpuResourceID;
+			if (i < vb_count) {
+				[compute_encoder useResource:mtl_tex usage:MTLResourceUsageRead];
+			}
+		}
+	}
+	[compute_encoder setBuffer:_geometry_textures offset:0 atIndex:3];
 	[compute_encoder setTexture:(__bridge id<MTLTexture>)output->impl._tex atIndex:0];
 	[compute_encoder setTexture:(__bridge id<MTLTexture>)_texpaint0->impl._tex atIndex:1];
 	[compute_encoder setTexture:(__bridge id<MTLTexture>)_texpaint1->impl._tex atIndex:2];
@@ -924,10 +1144,15 @@ void gpu_raytrace_dispatch_rays() {
 	[compute_encoder setTexture:(__bridge id<MTLTexture>)_texsobol->impl._tex atIndex:5];
 	[compute_encoder setTexture:(__bridge id<MTLTexture>)_texscramble->impl._tex atIndex:6];
 	[compute_encoder setTexture:(__bridge id<MTLTexture>)_texrank->impl._tex atIndex:7];
+	[compute_encoder setTexture:(__bridge id<MTLTexture>)_texenv_cdf->impl._tex atIndex:8];
 	[compute_encoder setSamplerState:linear_sampler atIndex:0];
 
 	for (id<MTLAccelerationStructure> primitive_accel in _primitive_accels) {
 		[compute_encoder useResource:primitive_accel usage:MTLResourceUsageRead];
+	}
+	for (int i = 0; i < vb_count; ++i) {
+		[compute_encoder useResource:(__bridge id<MTLBuffer>)vb[i]->impl.metal_buffer usage:MTLResourceUsageRead];
+		[compute_encoder useResource:(__bridge id<MTLBuffer>)ib[i]->impl.metal_buffer usage:MTLResourceUsageRead];
 	}
 
 	[compute_encoder setComputePipelineState:_raytracing_pipeline];

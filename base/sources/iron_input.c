@@ -1,12 +1,12 @@
 #include "iron_input.h"
 
-#include "iron_gc.h"
+#include "iron_alloc.h"
 #include "iron_string.h"
 #include "iron_system.h"
 #include <math.h>
 #include <stdbool.h>
 
-f32 sys_time(void);
+f64 sys_time(void);
 i32 sys_x(void);
 i32 sys_y(void);
 
@@ -61,7 +61,7 @@ i32_map_t      *keyboard_keys_started  = NULL;
 i32_map_t      *keyboard_keys_released = NULL;
 string_array_t *keyboard_keys_frame    = NULL;
 bool            keyboard_repeat_key    = false;
-f32             keyboard_repeat_time   = 0.0f;
+f64             keyboard_repeat_time   = 0.0;
 
 #ifdef WITH_GAMEPAD
 
@@ -105,19 +105,15 @@ void input_register(void) {
 	_input_occupied = false;
 
 	_mouse_buttons = string_array_create(0);
-	gc_root(_mouse_buttons);
 	string_array_push(_mouse_buttons, "left");
 	string_array_push(_mouse_buttons, "right");
 	string_array_push(_mouse_buttons, "middle");
 	string_array_push(_mouse_buttons, "side1");
 	string_array_push(_mouse_buttons, "side2");
 
-	_mouse_buttons_down = u8_array_create(0);
-	gc_root(_mouse_buttons_down);
-	_mouse_buttons_started = u8_array_create(0);
-	gc_root(_mouse_buttons_started);
+	_mouse_buttons_down     = u8_array_create(0);
+	_mouse_buttons_started  = u8_array_create(0);
 	_mouse_buttons_released = u8_array_create(0);
-	gc_root(_mouse_buttons_released);
 	for (i32 i = 0; i < 5; ++i) {
 		u8_array_push(_mouse_buttons_down, 0);
 		u8_array_push(_mouse_buttons_started, 0);
@@ -140,15 +136,11 @@ void input_register(void) {
 #endif
 
 	pen_buttons = string_array_create(0);
-	gc_root(pen_buttons);
 	string_array_push(pen_buttons, "tip");
 
-	pen_buttons_down = u8_array_create(0);
-	gc_root(pen_buttons_down);
-	pen_buttons_started = u8_array_create(0);
-	gc_root(pen_buttons_started);
+	pen_buttons_down     = u8_array_create(0);
+	pen_buttons_started  = u8_array_create(0);
 	pen_buttons_released = u8_array_create(0);
-	gc_root(pen_buttons_released);
 	u8_array_push(pen_buttons_down, 0);
 	u8_array_push(pen_buttons_started, 0);
 	u8_array_push(pen_buttons_released, 0);
@@ -165,7 +157,6 @@ void input_register(void) {
 	pen_last_y     = -1.0f;
 
 	keyboard_keys = string_array_create(0);
-	gc_root(keyboard_keys);
 	string_array_push(keyboard_keys, "a");
 	string_array_push(keyboard_keys, "b");
 	string_array_push(keyboard_keys, "c");
@@ -260,22 +251,17 @@ void input_register(void) {
 	string_array_push(keyboard_keys, "f11");
 	string_array_push(keyboard_keys, "f12");
 
-	keyboard_keys_down = i32_map_create();
-	gc_root(keyboard_keys_down);
-	keyboard_keys_started = i32_map_create();
-	gc_root(keyboard_keys_started);
+	keyboard_keys_down     = i32_map_create();
+	keyboard_keys_started  = i32_map_create();
 	keyboard_keys_released = i32_map_create();
-	gc_root(keyboard_keys_released);
 
 	keyboard_keys_frame = string_array_create(0);
-	gc_root(keyboard_keys_frame);
 
 	keyboard_repeat_key  = false;
 	keyboard_repeat_time = 0.0f;
 
 #ifdef WITH_GAMEPAD
 	gamepad_buttons_ps = string_array_create(0);
-	gc_root(gamepad_buttons_ps);
 	string_array_push(gamepad_buttons_ps, "cross");
 	string_array_push(gamepad_buttons_ps, "circle");
 	string_array_push(gamepad_buttons_ps, "square");
@@ -296,7 +282,6 @@ void input_register(void) {
 	string_array_push(gamepad_buttons_ps, "touchpad");
 
 	gamepad_buttons_xbox = string_array_create(0);
-	gc_root(gamepad_buttons_xbox);
 	string_array_push(gamepad_buttons_xbox, "a");
 	string_array_push(gamepad_buttons_xbox, "b");
 	string_array_push(gamepad_buttons_xbox, "x");
@@ -319,7 +304,6 @@ void input_register(void) {
 	gamepad_buttons = gamepad_buttons_ps;
 
 	gamepad_raws = any_array_create(0);
-	gc_root(gamepad_raws);
 #endif
 
 	keyboard_reset();
@@ -412,7 +396,7 @@ void mouse_move_listener(i32 x, i32 y, i32 movement_x, i32 movement_y) {
 		mouse_last_x = (f32)x;
 		mouse_last_y = (f32)y;
 	}
-	if (iron_mouse_is_locked()) {
+	if (iron_mouse_is_locked() || iron_mouse_movement_only) {
 		// Can be called multiple times per frame
 		mouse_movement_x += (f32)movement_x;
 		mouse_movement_y += (f32)movement_y;
@@ -528,6 +512,7 @@ void pen_down_listener(i32 x, i32 y, f32 pressure) {
 	pen_x                          = (f32)x;
 	pen_y                          = (f32)y;
 	pen_pressure                   = pressure;
+	pen_connected                  = true;
 
 #if !defined(IRON_ANDROID) && !defined(IRON_IOS)
 	mouse_down_listener(0, x, y);
@@ -621,11 +606,11 @@ void keyboard_reset(void) {
 }
 
 bool keyboard_down(char *key) {
-	return i32_map_get(keyboard_keys_down, key);
+	return i32_map_get(keyboard_keys_down, key) == 1;
 }
 
 bool keyboard_started(char *key) {
-	return i32_map_get(keyboard_keys_started, key);
+	return i32_map_get(keyboard_keys_started, key) == 1;
 }
 
 bool keyboard_started_any(void) {
@@ -633,11 +618,11 @@ bool keyboard_started_any(void) {
 }
 
 bool keyboard_released(char *key) {
-	return i32_map_get(keyboard_keys_released, key);
+	return i32_map_get(keyboard_keys_released, key) == 1;
 }
 
 bool keyboard_repeat(char *key) {
-	return i32_map_get(keyboard_keys_started, key) || (keyboard_repeat_key && i32_map_get(keyboard_keys_down, key));
+	return i32_map_get(keyboard_keys_started, key) == 1 || (keyboard_repeat_key && i32_map_get(keyboard_keys_down, key) == 1);
 }
 
 char *keyboard_key_code(i32 key) {
@@ -892,7 +877,7 @@ void keyboard_up_listener(i32 code) {
 void gamepad_end_frame(void) {}
 
 gamepad_stick_t *gamepad_stick_create(void) {
-	gamepad_stick_t *raw = gc_alloc(sizeof(gamepad_stick_t));
+	gamepad_stick_t *raw = calloc(1, sizeof(gamepad_stick_t));
 	raw->x               = 0.0f;
 	raw->y               = 0.0f;
 	raw->last_x          = 0.0f;
@@ -904,7 +889,7 @@ gamepad_stick_t *gamepad_stick_create(void) {
 }
 
 gamepad_t *gamepad_create(void) {
-	gamepad_t *raw        = gc_alloc(sizeof(gamepad_t));
+	gamepad_t *raw        = calloc(1, sizeof(gamepad_t));
 	raw->buttons_down     = f32_array_create(0);
 	raw->buttons_started  = u8_array_create(0);
 	raw->buttons_released = u8_array_create(0);
@@ -915,9 +900,7 @@ gamepad_t *gamepad_create(void) {
 }
 
 void gamepad_reset(void) {
-	gc_unroot(gamepad_raws);
 	gamepad_raws = any_array_create(0);
-	gc_root(gamepad_raws);
 	for (i32 i = 0; i < 4; ++i) {
 		gamepad_t *g = gamepad_create();
 		any_array_push(gamepad_raws, g);

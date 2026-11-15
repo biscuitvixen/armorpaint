@@ -1,6 +1,6 @@
 #include "iron_raycast.h"
 
-#include "iron_gc.h"
+#include "iron_alloc.h"
 #include "iron_math.h"
 #include <math.h>
 
@@ -43,7 +43,7 @@ ray_t *raycast_get_ray(f32 input_x, f32 input_y, camera_object_t *camera) {
 vec4_t raycast_box_intersect(transform_t *transform, f32 input_x, f32 input_y, camera_object_t *camera) {
 	ray_t *ray = raycast_get_ray(input_x, input_y, camera);
 	vec4_t c   = (vec4_t){transform_world_x(transform), transform_world_y(transform), transform_world_z(transform), 0.0};
-	vec4_t s   = (vec4_t){transform->dim.x, transform->dim.y, transform->dim.z, 0.0};
+	vec4_t s   = transform_dim(transform);
 	return ray_intersect_box(ray, c, s);
 }
 
@@ -87,7 +87,7 @@ vec4_t raycast_plane_intersect(vec4_t normal, vec4_t a, f32 input_x, f32 input_y
 }
 
 ray_t *ray_create(vec4_t origin, vec4_t dir) {
-	ray_t *raw  = gc_alloc(sizeof(ray_t));
+	ray_t *raw  = calloc(1, sizeof(ray_t));
 	raw->origin = origin;
 	raw->dir    = dir;
 	return raw;

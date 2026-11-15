@@ -4,11 +4,51 @@
 int tab_stages_selected = 0;
 
 stage_t *tab_stages_create_stage(char *name) {
-	stage_t *s = GC_ALLOC_INIT(stage_t, {0});
+	stage_t *s = ALLOC_INIT(stage_t, {0});
 	s->name    = name;
 	s->objects = string_array_create(0);
 	s->layers  = string_array_create(0);
+	s->hidden  = string_array_create(0);
 	return s;
+}
+
+void tab_stages_init() {
+	if (g_project->stages != NULL && g_project->stages->length > 0) {
+		return;
+	}
+	stage_t *s = tab_stages_create_stage("Stage 1");
+	for (i32 i = 0; i < g_project->_->paint_objects->length; ++i) {
+		mesh_object_t *o = g_project->_->paint_objects->buffer[i];
+		string_array_push(s->objects, o->base->name);
+		if (!o->base->visible) {
+			string_array_push(s->hidden, o->base->name);
+		}
+	}
+	for (i32 i = 0; i < g_project->_->layers->length; ++i) {
+		string_array_push(s->layers, g_project->_->layers->buffer[i]->name);
+	}
+	if (g_project->stages == NULL) {
+		g_project->stages = any_array_create_from_raw((void *[]){}, 0);
+	}
+	any_array_push(g_project->stages, s);
+	tab_stages_selected = 0;
+}
+
+bool tab_stages_is_hidden(stage_t *stage, char *name) {
+	return stage->hidden != NULL && string_array_index_of(stage->hidden, name) >= 0;
+}
+
+void tab_stages_set_hidden(stage_t *stage, char *name, bool hidden) {
+	if (stage->hidden == NULL) {
+		stage->hidden = string_array_create(0);
+	}
+	i32 idx = string_array_index_of(stage->hidden, name);
+	if (hidden && idx < 0) {
+		string_array_push(stage->hidden, name);
+	}
+	else if (!hidden && idx >= 0) {
+		array_splice(stage->hidden, idx, 1);
+	}
 }
 
 stage_t *tab_stages_get_stage() {
@@ -22,16 +62,45 @@ stage_t *tab_stages_get_stage() {
 }
 
 void tab_stages_apply(stage_t *stage) {
+	tab_timeline_set_stage(stage);
 	mesh_object_t_array_t *visibles = any_array_create_from_raw((void *[]){}, 0);
 	for (i32 i = 0; i < g_project->_->paint_objects->length; ++i) {
 		mesh_object_t *p = g_project->_->paint_objects->buffer[i];
-		p->base->visible = string_array_index_of(stage->objects, p->base->name) >= 0;
+		p->base->visible = string_array_index_of(stage->objects, p->base->name) >= 0 && !tab_stages_is_hidden(stage, p->base->name);
 		if (p->base->visible) {
 			any_array_push(visibles, p);
 		}
 	}
 	util_mesh_merge(visibles);
+	util_physics_apply_stage(stage);
 	g_context->ddirty = 2;
+}
+
+void tab_stages_apply_visible(mesh_object_t *o) {
+	stage_t *stage = tab_stages_get_stage();
+	if (stage != NULL) {
+		tab_stages_set_hidden(stage, o->base->name, !o->base->visible);
+	}
+	if (tab_meshes_get_linked_override(o) >= 0) {
+		render_path_raytrace_ready = false;
+		g_context->ddirty          = 2;
+		return;
+	}
+	util_mesh_visibility_changed();
+}
+
+void tab_stages_add_object(char *name) {
+	stage_t *stage = tab_stages_get_stage();
+	if (stage != NULL && string_array_index_of(stage->objects, name) < 0) {
+		string_array_push(stage->objects, name);
+	}
+}
+
+void tab_stages_add_layer(char *name) {
+	stage_t *stage = tab_stages_get_stage();
+	if (stage != NULL && string_array_index_of(stage->layers, name) < 0) {
+		string_array_push(stage->layers, name);
+	}
 }
 
 void tab_stages_rename_object(char *old_name, char *new_name) {
@@ -43,6 +112,14 @@ void tab_stages_rename_object(char *old_name, char *new_name) {
 		for (i32 j = 0; j < s->objects->length; ++j) {
 			if (string_equals(s->objects->buffer[j], old_name)) {
 				s->objects->buffer[j] = string_copy(new_name);
+			}
+		}
+		if (s->hidden == NULL) {
+			continue;
+		}
+		for (i32 j = 0; j < s->hidden->length; ++j) {
+			if (string_equals(s->hidden->buffer[j], old_name)) {
+				s->hidden->buffer[j] = string_copy(new_name);
 			}
 		}
 	}
@@ -82,6 +159,12 @@ void tab_stages_prune() {
 			}
 		}
 
+		for (i32 j = s->hidden != NULL ? s->hidden->length - 1 : -1; j >= 0; --j) {
+			if (string_array_index_of(s->objects, s->hidden->buffer[j]) < 0) {
+				array_splice(s->hidden, j, 1);
+			}
+		}
+
 		for (i32 j = s->layers->length - 1; j >= 0; --j) {
 			bool found = false;
 			for (i32 k = 0; k < g_project->_->layers->length; ++k) {
@@ -95,4 +178,70 @@ void tab_stages_prune() {
 			}
 		}
 	}
+}
+
+static bool tab_stages_any_has_object(char *name) {
+	for (i32 i = 0; i < g_project->stages->length; ++i) {
+		if (string_array_index_of(g_project->stages->buffer[i]->objects, name) >= 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool tab_stages_any_has_layer(char *name) {
+	for (i32 i = 0; i < g_project->stages->length; ++i) {
+		if (string_array_index_of(g_project->stages->buffer[i]->layers, name) >= 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool tab_stages_layer_used(slot_layer_t *l) {
+	// The layer or any of its children, masks or filters is in a stage
+	for (i32 i = 0; i < g_project->_->layers->length; ++i) {
+		slot_layer_t *c = g_project->_->layers->buffer[i];
+		for (slot_layer_t *p = c; p != NULL; p = p->parent) {
+			if (p == l) {
+				if (tab_stages_any_has_layer(c->name)) {
+					return true;
+				}
+				break;
+			}
+		}
+	}
+	return false;
+}
+
+void tab_stages_delete_unused() {
+	// Deleting a layer takes its children along, start from the topmost unused one
+	while (true) {
+		slot_layer_t *unused = NULL;
+		for (i32 i = 0; i < g_project->_->layers->length; ++i) {
+			slot_layer_t *l = g_project->_->layers->buffer[i];
+			if (!tab_stages_layer_used(l) && (l->parent == NULL || tab_stages_layer_used(l->parent)) && tab_layers_can_delete(l)) {
+				unused = l;
+				break;
+			}
+		}
+		if (unused == NULL) {
+			break;
+		}
+		tab_layers_delete_layer(unused);
+	}
+
+	mesh_object_t_array_t *objects = g_project->_->paint_objects;
+	mesh_object_t_array_t *unused  = any_array_create_from_raw((void *[]){}, 0);
+	for (i32 i = 0; i < objects->length; ++i) {
+		if (!tab_stages_any_has_object(objects->buffer[i]->base->name)) {
+			any_array_push(unused, objects->buffer[i]);
+		}
+	}
+	// At least one mesh has to remain, keep the first one
+	i32 first = unused->length == objects->length ? 1 : 0;
+	for (i32 i = unused->length - 1; i >= first; --i) {
+		tab_meshes_draw_context_menu_delete(unused->buffer[i]);
+	}
+	array_delete(unused);
 }

@@ -3,11 +3,11 @@
 #pragma clang diagnostic ignored "-Wincompatible-pointer-types"
 
 #include "const_data.h"
+#include "iron_alloc.h"
 #include "iron_armpack.h"
 #include "iron_array.h"
 #include "iron_draw.h"
 #include "iron_file.h"
-#include "iron_gc.h"
 #include "iron_gpu.h"
 #include "iron_json.h"
 #include "iron_lz4.h"
@@ -40,10 +40,6 @@
 #include EMBED_H_PATH
 #endif
 
-#define ID__(x, y) x ":" #y
-#define ID_(x, y)  ID__(x, y)
-#define __ID__     ID_(__FILE__, __LINE__)
-
 int    _argc;
 char **_argv;
 
@@ -62,20 +58,28 @@ buffer_t *embed_get(char *key) {
 	}
 	return NULL;
 }
+
+bool embed_owns(uint8_t *buffer) {
+	for (int i = 0; i < embed_count; ++i) {
+		if (embed_values[i] == buffer) {
+			return true;
+		}
+	}
+	return false;
+}
 #endif
 
 void _kickstart();
-bool enable_window = true;
-bool in_background = false;
-int  paused_frames = 0;
+bool enable_window           = true;
+bool in_background           = false;
+int  paused_frames           = 0;
+bool (*iron_idle_wake)(void) = NULL;
 #ifdef IDLE_SLEEP
 bool input_down         = false;
 int  last_window_width  = 0;
 int  last_window_height = 0;
 #endif
 char temp_string[1024 * 128];
-char temp_string_vs[1024 * 128];
-char temp_string_fs[1024 * 128];
 #ifdef IRON_WINDOWS
 wchar_t        temp_wstring[1024 * 32];
 struct HWND__ *iron_windows_window_handle();
@@ -147,13 +151,11 @@ int kickstart(int argc, char **argv) {
 
 	iron_threads_init();
 	iron_display_init();
-	gc_start(&argc);
 	_kickstart();
 
 #ifdef IRON_AUDIO
 	iron_a2_shutdown();
 #endif
-	gc_stop();
 	return 0;
 }
 
@@ -178,7 +180,6 @@ char *iron_get_arg(i32 index) {
 #include "iron_net.h"
 #include "iron_raycast.h"
 #include "iron_shape.h"
-#include "iron_sys.h"
 #include "iron_tween.h"
 #include "kong/dir.h"
 #include <lz4x.h>
@@ -225,7 +226,11 @@ void _update() {
 #else
 	const int start_sleep = 120;
 #endif
-	if (++paused_frames > start_sleep && !input_down) {
+	++paused_frames;
+	if (paused_frames > start_sleep && paused_frames % 100 == 0 && iron_idle_wake != NULL && iron_idle_wake()) {
+		paused_frames = 0;
+	}
+	if (paused_frames > start_sleep && !input_down) {
 #ifdef IRON_WINDOWS
 		Sleep(1);
 #elif !defined(IRON_WASM)
@@ -236,11 +241,9 @@ void _update() {
 #endif
 		return;
 	}
-	if (paused_frames == 30) {
-		gc_run();
-	}
 #endif
 
+	string_tmp_reset();
 	iron_net_update();
 	iron_update();
 	if (ui_get_current())
@@ -248,14 +251,12 @@ void _update() {
 	gpu_present();
 }
 
-char *_copy(void *data) {
-	strcpy(temp_string, ui_copy());
-	return temp_string;
+void _copy(void *data) {
+	ui_copy();
 }
 
-char *_cut(void *data) {
-	strcpy(temp_string, ui_cut());
-	return temp_string;
+void _cut(void *data) {
+	ui_cut();
 }
 
 void _paste(char *text, void *data) {
@@ -505,26 +506,6 @@ f32 math_fmod(f32 x, f32 y) {
 	return fmod(x, y);
 }
 
-#ifdef _WIN32
-i32 parse_int(const char *s) {
-	return _strtoi64(s, NULL, 10);
-}
-i32 parse_int_hex(const char *s) {
-	return _strtoi64(s, NULL, 16);
-}
-#else
-i32 parse_int(const char *s) {
-	return strtol(s, NULL, 10);
-}
-i32 parse_int_hex(const char *s) {
-	return strtol(s, NULL, 16);
-}
-#endif
-
-f32 parse_float(const char *s) {
-	return strtof(s, NULL);
-}
-
 i32 color_from_floats(f32 r, f32 g, f32 b, f32 a) {
 	return ((int)(a * 255) << 24) | ((int)(r * 255) << 16) | ((int)(g * 255) << 8) | (int)(b * 255);
 }
@@ -542,7 +523,7 @@ u8 color_get_bb(i32 c) {
 }
 
 u8 color_get_ab(i32 c) {
-	return c & 0x000000ff;
+	return (c & 0xff000000) >> 24;
 }
 
 i32 color_set_rb(i32 c, u8 i) {
@@ -708,36 +689,26 @@ gpu_shader_t *gpu_create_shader(buffer_t *data, i32 shader_type) {
 	return shader;
 }
 
+void gpu_delete_shader(gpu_shader_t *shader) {
+	gpu_shader_destroy(shader);
+	free(shader);
+}
+
 #ifdef WITH_KONG
 void gpu_create_shaders_from_kong(char *kong, char **vs, char **fs, int *vs_size, int *fs_size);
 #endif
 
 gpu_shader_t *gpu_create_shader_from_source(char *source, int source_size, gpu_shader_type_t shader_type) {
-	gpu_shader_t *shader        = (gpu_shader_t *)malloc(sizeof(gpu_shader_t));
-	char         *temp_string_s = shader_type == GPU_SHADER_TYPE_VERTEX ? temp_string_vs : temp_string_fs;
+	gpu_shader_t *shader = (gpu_shader_t *)malloc(sizeof(gpu_shader_t));
 
 #ifdef WITH_D3DCOMPILER
 
-	strcpy(temp_string_s, source);
-
-	ID3DBlob *error_message;
-	ID3DBlob *shader_buffer;
-	UINT      flags = D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_SKIP_VALIDATION;
-	HRESULT hr = D3DCompile(temp_string_s, strlen(source) + 1, NULL, NULL, NULL, "main", shader_type == GPU_SHADER_TYPE_VERTEX ? "vs_5_0" : "ps_5_0", flags, 0,
-	                        &shader_buffer, &error_message);
-	if (hr != S_OK) {
-		iron_log("%s", (char *)error_message->lpVtbl->GetBufferPointer(error_message));
-		return NULL;
-	}
-
-	int size = shader_buffer->lpVtbl->GetBufferSize(shader_buffer);
-	gpu_shader_init(shader, (char *)shader_buffer->lpVtbl->GetBufferPointer(shader_buffer), size, shader_type);
-	shader_buffer->lpVtbl->Release(shader_buffer);
+	gpu_shader_init(shader, source, strlen(source) + 1, shader_type);
+	shader->impl.is_source = true;
 
 #elif defined(IRON_METAL)
 
-	strcpy(temp_string_s, source);
-	gpu_shader_init(shader, temp_string_s, strlen(temp_string_s), shader_type);
+	gpu_shader_init(shader, source, strlen(source), shader_type);
 
 #elif defined(IRON_VULKAN)
 
@@ -745,8 +716,7 @@ gpu_shader_t *gpu_create_shader_from_source(char *source, int source_size, gpu_s
 
 #elif defined(IRON_WASM)
 
-	strcpy(temp_string_s, source);
-	gpu_shader_init(shader, temp_string_s, strlen(temp_string_s), shader_type);
+	gpu_shader_init(shader, source, strlen(source), shader_type);
 
 #endif
 
@@ -774,25 +744,34 @@ gpu_texture_t *gpu_create_render_target(i32 width, i32 height, i32 format) {
 gpu_texture_t *gpu_create_texture_from_bytes(buffer_t *data, i32 width, i32 height, i32 format) {
 	gpu_texture_t *texture = (gpu_texture_t *)malloc(sizeof(gpu_texture_t));
 	texture->buffer        = NULL;
-	gpu_texture_init_from_bytes(texture, data->buffer, width, height, (gpu_texture_format_t)format);
+	gpu_texture_init_from_bytes(texture, data->buffer, width, height, (gpu_texture_format_t)format, true);
 	return texture;
 }
 
-gpu_texture_t *gpu_create_texture_from_encoded_bytes(buffer_t *data, char *format) {
-	if (data == NULL || data->length == 0) {
-		return NULL;
-	}
-	if (ends_with(format, "txt")) { // plugin
-		return NULL;
-	}
+gpu_texture_t *gpu_create_texture_from_bytes_raw(buffer_t *data, i32 width, i32 height, i32 format) {
 	gpu_texture_t *texture = (gpu_texture_t *)malloc(sizeof(gpu_texture_t));
 	texture->buffer        = NULL;
+	gpu_texture_init_from_bytes(texture, data->buffer, width, height, (gpu_texture_format_t)format, false);
+	return texture;
+}
+
+typedef struct iron_image_pixels {
+	unsigned char       *data;
+	int                  width;
+	int                  height;
+	gpu_texture_format_t format;
+} iron_image_pixels_t;
+
+bool iron_decode_image(buffer_t *data, char *format, iron_image_pixels_t *out) {
+	if (data == NULL || data->length == 0) {
+		return false;
+	}
 	unsigned char       *texture_data;
 	gpu_texture_format_t texture_format;
 	int                  width;
 	int                  height;
 
-	if (ends_with(format, "k")) {
+	if (path_has_ext(format, "k")) {
 		width  = iron_read_s32le(data->buffer);
 		height = iron_read_s32le(data->buffer + 4);
 		char fourcc[5];
@@ -808,6 +787,22 @@ gpu_texture_t *gpu_create_texture_from_encoded_bytes(buffer_t *data, char *forma
 			LZ4_decompress_safe((char *)data->buffer + 12, (char *)texture_data, compressed_size, output_size);
 			texture_format = GPU_TEXTURE_FORMAT_RGBA32;
 		}
+		else if (strcmp(fourcc, "LZ4G") == 0) {
+			// Gray+alpha, decompress into the upper half and expand to rgba in place
+			int pixels        = width * height;
+			texture_data      = (unsigned char *)malloc(pixels * 4);
+			unsigned char *la = texture_data + pixels * 2;
+			LZ4_decompress_safe((char *)data->buffer + 12, (char *)la, compressed_size, pixels * 2);
+			for (int i = 0; i < pixels; ++i) {
+				unsigned char l         = la[i * 2];
+				unsigned char a         = la[i * 2 + 1];
+				texture_data[i * 4]     = l;
+				texture_data[i * 4 + 1] = l;
+				texture_data[i * 4 + 2] = l;
+				texture_data[i * 4 + 3] = a;
+			}
+			texture_format = GPU_TEXTURE_FORMAT_RGBA32;
+		}
 		else { // "LZ4F"
 			int output_size = width * height * 8;
 			texture_data    = (unsigned char *)malloc(output_size);
@@ -815,9 +810,12 @@ gpu_texture_t *gpu_create_texture_from_encoded_bytes(buffer_t *data, char *forma
 			texture_format = GPU_TEXTURE_FORMAT_RGBA64;
 		}
 	}
-	else if (ends_with(format, "hdr")) {
+	else if (path_has_ext(format, "hdr")) {
 		int comp;
-		texture_data   = (unsigned char *)stbi_loadf_from_memory(data->buffer, data->length, &width, &height, &comp, 4);
+		texture_data = (unsigned char *)stbi_loadf_from_memory(data->buffer, data->length, &width, &height, &comp, 4);
+		if (texture_data == NULL) {
+			return false;
+		}
 		texture_format = GPU_TEXTURE_FORMAT_RGBA64;
 		// F32 to F16
 		float    *f32_data = (float *)texture_data;
@@ -832,16 +830,36 @@ gpu_texture_t *gpu_create_texture_from_encoded_bytes(buffer_t *data, char *forma
 		texture_format = GPU_TEXTURE_FORMAT_RGBA32;
 	}
 
-	// double t = iron_time(); ////
-	gpu_texture_init_from_bytes(texture, texture_data, width, height, texture_format);
-	// iron_log("gpu_texture_init_from_bytes in %fs\n", iron_time() - t); ////
-	free(texture_data);
+	out->data   = texture_data;
+	out->width  = width;
+	out->height = height;
+	out->format = texture_format;
+	return texture_data != NULL;
+}
 
+gpu_texture_t *gpu_create_texture_from_pixels(iron_image_pixels_t *pixels) {
+	gpu_texture_t *texture = (gpu_texture_t *)malloc(sizeof(gpu_texture_t));
+	texture->buffer        = NULL;
+	gpu_texture_init_from_bytes(texture, pixels->data, pixels->width, pixels->height, pixels->format, true);
+	free(pixels->data);
+	pixels->data = NULL;
 	return texture;
+}
+
+gpu_texture_t *gpu_create_texture_from_encoded_bytes(buffer_t *data, char *format) {
+	iron_image_pixels_t pixels;
+	if (!iron_decode_image(data, format, &pixels)) {
+		return NULL;
+	}
+	return gpu_create_texture_from_pixels(&pixels);
 }
 
 void gpu_delete_texture(gpu_texture_t *texture) {
 	gpu_texture_destroy(texture);
+	if (texture->buffer != NULL) { // Cached by gpu_get_texture_pixels
+		free(texture->buffer->buffer);
+		free(texture->buffer);
+	}
 	free(texture);
 }
 
@@ -862,15 +880,26 @@ gpu_texture_t *iron_load_texture(char *file) {
 	iron_file_reader_read(&reader, data, size);
 	iron_file_reader_close(&reader);
 	buffer_t buf;
-	buf.buffer = data;
-	buf.length = size;
-	return gpu_create_texture_from_encoded_bytes(&buf, file);
+	buf.buffer             = data;
+	buf.length             = size;
+	gpu_texture_t *texture = gpu_create_texture_from_encoded_bytes(&buf, file);
+	free(data); // Encoded bytes are decoded into a separate buffer
+	return texture;
 }
 
 void *iron_load_sound(char *file) {
 #ifdef IRON_AUDIO
 	iron_a1_init();
 	iron_a1_sound_t *sound = iron_a1_sound_create(file);
+	return sound;
+#endif
+	return NULL;
+}
+
+void *iron_load_sound_from_bytes(buffer_t *data, char *format) {
+#ifdef IRON_AUDIO
+	iron_a1_init();
+	iron_a1_sound_t *sound = iron_a1_sound_create_from_bytes(data->buffer, data->length, format);
 	return sound;
 #endif
 	return NULL;
@@ -893,6 +922,20 @@ buffer_t *iron_load_blob(char *file) {
 	iron_file_reader_read(&reader, buffer->buffer, reader_size);
 	iron_file_reader_close(&reader);
 	return buffer;
+}
+
+void iron_delete_blob(buffer_t *buffer) {
+	if (buffer == NULL) {
+		return;
+	}
+#ifdef WITH_EMBED
+	if (embed_owns(buffer->buffer)) {
+		free(buffer);
+		return;
+	}
+#endif
+	array_free(buffer);
+	free(buffer);
 }
 
 i32 iron_display_ppi(i32 index) {

@@ -12,15 +12,9 @@ static void _compass_init_hitbox() {
 		return;
 	}
 
-	gc_unroot(_compass_hitbox_x);
 	_compass_hitbox_x = object_create(true);
-	gc_root(_compass_hitbox_x);
-	gc_unroot(_compass_hitbox_y);
 	_compass_hitbox_y = object_create(true);
-	gc_root(_compass_hitbox_y);
-	gc_unroot(_compass_hitbox_z);
 	_compass_hitbox_z = object_create(true);
-	gc_root(_compass_hitbox_z);
 
 	_compass_hitbox_x->transform->scale = (vec4_t){0.15, 0.15, 0.15, 1.0};
 	_compass_hitbox_y->transform->scale = (vec4_t){0.15, 0.15, 0.15, 1.0};
@@ -36,26 +30,28 @@ static void _compass_init_hitbox() {
 	object_set_parent(_compass_hitbox_z, compass);
 }
 
+bool render_compass_is_hitbox(object_t *o) {
+	return o != NULL && (o == _compass_hitbox_x || o == _compass_hitbox_y || o == _compass_hitbox_z);
+}
+
 static bool _compass_compare_quat(quat_t a, quat_t b) {
 	return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
 }
 
 void render_compass() {
-	if (!g_context->show_compass || g_config->workspace == WORKSPACE_PLAYER || g_context->capturing_screenshot) {
+	if (!g_context->show_compass || base_player || g_context->capturing_screenshot) {
 		return;
 	}
 
 	camera_object_t *cam     = scene_camera;
 	mesh_object_t   *compass = scene_get_child(".Compass")->ext;
 
-	bool      _visible     = compass->base->visible;
-	object_t *_parent      = compass->base->parent;
-	quat_t    crot         = cam->base->transform->rot;
-	f32       ratio        = sys_w() / (float)sys_h();
-	mat4_t    _P           = cam->p;
-	cam->p                 = mat4_ortho(-8 * ratio, 8 * ratio, -8, 8, -2, 2);
-	compass->base->visible = true;
-	compass->base->parent  = cam->base;
+	object_t *_parent     = compass->base->parent;
+	quat_t    crot        = cam->base->transform->rot;
+	f32       ratio       = sys_w() / (float)sys_h();
+	mat4_t    _P          = cam->p;
+	cam->p                = mat4_ortho(-8 * ratio, 8 * ratio, -8, 8, -2, 2);
+	compass->base->parent = cam->base;
 
 	f32  compass_x    = 7.4;
 	f32  compass_y    = 7.0;
@@ -76,8 +72,7 @@ void render_compass() {
 	compass->base->transform->rot   = (quat_t){-crot.x, -crot.y, -crot.z, crot.w};
 	compass->base->transform->scale = (vec4_t){0.4, 0.4, 0.4, 1.0};
 	transform_build_matrix(compass->base->transform);
-	compass->frustum_culling = false;
-	mesh_object_render(compass, "overlay", NULL);
+	mesh_object_draw(compass, render_path_base_own_scon(compass), NULL);
 
 	if (_compass_hovered != NULL) {
 		line_draw_color    = _compass_hovered == _compass_hitbox_x ? 0xffff0000 : _compass_hovered == _compass_hitbox_y ? 0xff00ff00 : 0xff0000ff;
@@ -85,9 +80,8 @@ void render_compass() {
 		shape_draw_sphere(_compass_hovered->transform->world);
 	}
 
-	cam->p                 = _P;
-	compass->base->visible = _visible;
-	compass->base->parent  = _parent;
+	cam->p                = _P;
+	compass->base->parent = _parent;
 }
 
 void render_compass_update() {
@@ -96,12 +90,9 @@ void render_compass_update() {
 	}
 
 	if (_compass_hovered_last != _compass_hovered) {
-		gc_unroot(_compass_hovered_last);
 		_compass_hovered_last = _compass_hovered;
-		gc_root(_compass_hovered_last);
-		g_context->ddirty = 2;
+		g_context->ddirty     = 2;
 	}
-	gc_unroot(_compass_hovered);
 	_compass_hovered = NULL;
 
 	f32  x     = mouse_view_x() / (float)sys_w();
@@ -138,9 +129,7 @@ void render_compass_update() {
 					    ? viewport_set_view(-1, 0, 0, math_pi() / 2.0, 0, -math_pi() / 2.0) // Left
 					    : viewport_set_view(1, 0, 0, math_pi() / 2.0, 0, math_pi() / 2.0);  // Right
 				}
-				gc_unroot(_compass_hovered);
 				_compass_hovered = _compass_hitbox_x;
-				gc_root(_compass_hovered);
 			}
 
 			else if (t == _compass_hitbox_y->transform) {
@@ -149,9 +138,7 @@ void render_compass_update() {
 					    ? viewport_set_view(0, -1, 0, math_pi() / 2.0, 0, 0)         // Front
 					    : viewport_set_view(0, 1, 0, math_pi() / 2.0, 0, math_pi()); // Back
 				}
-				gc_unroot(_compass_hovered);
 				_compass_hovered = _compass_hitbox_y;
-				gc_root(_compass_hovered);
 			}
 
 			else {
@@ -159,9 +146,7 @@ void render_compass_update() {
 					_compass_compare_quat(quat_from_euler(0, 0, 0), cq) ? viewport_set_view(0, 0, -1, math_pi(), 0, math_pi()) // Bottom
 					                                                    : viewport_set_view(0, 0, 1, 0, 0, 0);                 // Top
 				}
-				gc_unroot(_compass_hovered);
 				_compass_hovered = _compass_hitbox_z;
-				gc_root(_compass_hovered);
 			}
 		}
 		scene_camera->p = _P;

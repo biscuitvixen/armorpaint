@@ -12,7 +12,8 @@ name: Build & Release (Windows / Linux / macOS)
 # between those, the daily run only rebuilds the latest release when it is
 # missing a platform's asset and upstream is still at the same SHA, which
 # covers a matrix leg that never got a runner. `workflow_dispatch` bypasses
-# the check and always builds.
+# the check and always builds. After each release the oldest are pruned so
+# only the newest KEEP_RELEASES remain.
 #
 # This fork is a stock mirror, so the build clones upstream `main` fresh and
 # builds it, independent of how far behind this fork's own branches happen to
@@ -44,6 +45,8 @@ env:
   # 6.5 days: a week less slack for scheduled runs starting late, so a
   # release published a few hours after its cron does not slip a day.
   RELEASE_GAP_HOURS: 156
+  # Roughly ten weeks of weekly builds.
+  KEEP_RELEASES: 10
 
 jobs:
   check:
@@ -221,3 +224,26 @@ jobs:
             run `xattr -dr com.apple.quarantine ArmorPaint.app`.
           files: dist/*
           fail_on_unmatched_files: false
+
+      - name: 🧹 Prune old releases
+        # An empty dist means every build failed and the release just
+        # published has no assets; pruning would then trade a working build
+        # for an empty one.
+        if: hashFiles('dist/*') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # A release's createdAt is the date of its tagged commit, which is
+          # the same fork commit for every release here, so order by
+          # publishedAt. Only this workflow's own tags are ever deleted.
+          gh release list --limit 1000 --json tagName,publishedAt,isDraft \
+            | jq -r --argjson keep "$KEEP_RELEASES" '
+                map(select((.isDraft | not) and (.tagName | startswith("armorpaint-"))))
+                | sort_by(.publishedAt) | reverse | .[$keep:][] | .tagName' \
+            | while read -r TAG; do
+                echo "🗑️ Deleting $TAG"
+                gh release delete "$TAG" --cleanup-tag --yes
+              done

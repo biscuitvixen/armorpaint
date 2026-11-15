@@ -9,15 +9,15 @@ name: Build & Release (Windows / Linux / macOS)
 # A daily `check` job compares upstream HEAD against the SHA embedded in the
 # latest release tag (armorpaint-<date>-<sha>). Upstream commits most days,
 # so a new release is built only once the last one is about a week old;
-# between those, the daily run only rebuilds the latest release when it is
-# missing a platform's asset and upstream is still at the same SHA, which
-# covers a matrix leg that never got a runner. `workflow_dispatch` bypasses
+# between those, the daily run only rebuilds the latest release from its own
+# commit when it is missing a platform's asset, which covers a matrix leg
+# that never got a runner. `workflow_dispatch` bypasses
 # the check and always builds. After each release the oldest are pruned so
 # only the newest KEEP_RELEASES remain.
 #
-# This fork is a stock mirror, so the build clones upstream `main` fresh and
-# builds it, independent of how far behind this fork's own branches happen to
-# be. Nothing is fetched at build time beyond the upstream clone: the amake
+# This fork is a stock mirror, so each build fetches the upstream commit the
+# check job chose and builds it, independent of how far behind this fork's
+# own branches happen to be. Nothing is fetched at build time beyond the upstream clone: the amake
 # build tool and all dependencies are vendored in the repo.
 
 on:
@@ -54,6 +54,7 @@ jobs:
     outputs:
       build: ${{ steps.gate.outputs.build }}
       sha: ${{ steps.gate.outputs.sha }}
+      full_sha: ${{ steps.gate.outputs.full_sha }}
       tag: ${{ steps.gate.outputs.tag }}
     steps:
       - name: 🕵️ Compare upstream HEAD with last release
@@ -66,8 +67,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          SHA=$(git ls-remote "$UPSTREAM_URL" "refs/heads/$UPSTREAM_BRANCH" | cut -c1-7)
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          FULL_SHA=$(git ls-remote "$UPSTREAM_URL" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
+          SHA="${FULL_SHA:0:7}"
 
           # Latest release tag looks like armorpaint-<date>-<sha>; the suffix
           # is the upstream SHA that release was built from. No release yet
@@ -85,28 +86,37 @@ jobs:
           PUBLISHED=$(jq -r '.publishedAt // "@0"' <<< "$LAST")
           AGE_HOURS=$(( ($(date -u +%s) - $(date -u -d "$PUBLISHED" +%s)) / 3600 ))
 
-          # The tag is fixed here, not when publishing, so the release job
-          # names what this job decided to build. A gap-fill reuses the
-          # existing tag and adds the missing assets to that release.
+          # The commit and tag are fixed here, not in the build or release
+          # jobs, so every leg builds the same commit and the release names
+          # it. A gap-fill rebuilds the latest release's own commit under its
+          # existing tag, adding the missing assets to that release.
           TAG="armorpaint-$(date -u +%Y%m%d)-$SHA"
 
+          # A due weekly release comes before a gap-fill, since it replaces
+          # the incomplete release as the latest.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "🔧 Manual run - building regardless of upstream state."
             echo "build=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SHA" = "$LAST_SHA" ] && [ -n "$MISSING" ]; then
-            echo "🧩 $LAST_TAG is missing: $MISSING. Rebuilding $SHA into it."
-            TAG="$LAST_TAG"
-            echo "build=true" >> "$GITHUB_OUTPUT"
-          elif [ "$SHA" = "$LAST_SHA" ]; then
+          elif [ "$SHA" = "$LAST_SHA" ] && [ -z "$MISSING" ]; then
             echo "✅ Upstream $UPSTREAM_BRANCH still at $SHA (last release: ${LAST_TAG:-none}). Nothing to build."
             echo "build=false" >> "$GITHUB_OUTPUT"
-          elif [ "$AGE_HOURS" -lt "$RELEASE_GAP_HOURS" ]; then
-            echo "⏳ Upstream moved: $LAST_SHA -> $SHA, but $LAST_TAG is only ${AGE_HOURS}h old (gap: ${RELEASE_GAP_HOURS}h). Waiting."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "$SHA" != "$LAST_SHA" ] && [ "$AGE_HOURS" -ge "$RELEASE_GAP_HOURS" ]; then
             echo "🆕 Upstream moved: ${LAST_SHA:-none} -> $SHA. Building."
             echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$MISSING" ] && [ -n "$LAST_TAG" ]; then
+            # The tag holds only a short SHA; the commits API expands it.
+            UPSTREAM_REPO="${UPSTREAM_URL#https://github.com/}"
+            FULL_SHA=$(gh api "repos/${UPSTREAM_REPO%.git}/commits/$LAST_SHA" -q .sha)
+            SHA="$LAST_SHA"
+            TAG="$LAST_TAG"
+            echo "🧩 $LAST_TAG is missing: $MISSING. Rebuilding $SHA into it."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "⏳ Upstream moved: $LAST_SHA -> $SHA, but $LAST_TAG is only ${AGE_HOURS}h old (gap: ${RELEASE_GAP_HOURS}h). Waiting."
+            echo "build=false" >> "$GITHUB_OUTPUT"
           fi
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   build:
@@ -133,8 +143,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --quiet make clang libvulkan-dev libgtk-3-dev libasound2-dev
 
-      - name: 📂 Clone pristine upstream (${{ env.UPSTREAM_BRANCH }})
-        run: git clone --single-branch --depth 1 -b "${{ env.UPSTREAM_BRANCH }}" "${{ env.UPSTREAM_URL }}" armorpaint-src
+      - name: 📂 Fetch pristine upstream at ${{ needs.check.outputs.sha }}
+        # GitHub serves a shallow fetch of any reachable commit by its full
+        # SHA, so this costs the same as a shallow clone of the branch.
+        shell: bash
+        env:
+          FULL_SHA: ${{ needs.check.outputs.full_sha }}
+        run: |
+          git init -q armorpaint-src
+          git -C armorpaint-src fetch --depth 1 "$UPSTREAM_URL" "$FULL_SHA"
+          git -C armorpaint-src checkout -q FETCH_HEAD
 
       - name: 🔨 Build
         # Forward slashes work in every runner's default shell; on Windows
@@ -195,8 +213,7 @@ jobs:
       - name: 🏷️ Resolve version
         id: ver
         run: |
-          # Use the SHA the check job saw, not a fresh ls-remote: if upstream
-          # moves mid-build, the tag should still match what was built.
+          # The commit every leg built, as chosen by the check job.
           echo "sha=${{ needs.check.outputs.sha }}" >> "$GITHUB_OUTPUT"
           echo "tag=${{ needs.check.outputs.tag }}" >> "$GITHUB_OUTPUT"
 

@@ -204,6 +204,9 @@ jobs:
         run: ls -l dist || true
 
       - name: 🚀 Publish release
+        # An empty dist means every build failed; publishing would create a
+        # release with no assets that becomes the latest.
+        if: hashFiles('dist/*') != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
@@ -226,9 +229,7 @@ jobs:
           fail_on_unmatched_files: false
 
       - name: 🧹 Prune old releases
-        # An empty dist means every build failed and the release just
-        # published has no assets; pruning would then trade a working build
-        # for an empty one.
+        # Prune only after a release was published.
         if: hashFiles('dist/*') != ''
         env:
           GH_TOKEN: ${{ github.token }}
